@@ -569,21 +569,9 @@ impl Module {
             }
             w.record(3, &r);
         }
-        // 5 (`VICTORY_DENORM`): the entry's float mode, `"fp32-denorm-mode"="<mode>"`
-        let groups = if let Some(mode) = denorm_mode() {
-            let mut r = vec![5, 0xFFFF_FFFF, 4];
-            r.extend(b"fp32-denorm-mode".iter().map(|&c| u64::from(c)));
-            r.push(0);
-            r.extend(mode.bytes().map(u64::from));
-            r.push(0);
-            w.record(3, &r);
-            5
-        } else {
-            4
-        };
         w.exit();
         w.enter(PARAMATTR_BLOCK, 3);
-        for id in 1..=groups {
+        for id in 1..=4 {
             w.record(2, &[id]);
         }
         w.exit();
@@ -649,11 +637,7 @@ impl Module {
         for f in &self.funcs {
             // [type, cc, isproto, linkage, paramattr, align, section,
             // visibility, gc, unnamed_addr, prologue, dllstorage, comdat, prefix]
-            let attr = match f.attr {
-                Some(a) => a as u64,
-                None if f.body && denorm_mode().is_some() => 5,
-                None => 0,
-            };
+            let attr = f.attr.map_or(0, |a| a as u64);
             w.record(
                 8,
                 &[
@@ -914,19 +898,6 @@ impl Module {
 }
 
 const MODULE_BLOCK: u64 = 8;
-/// The entry function's `fp32-denorm-mode` that `VICTORY_DENORM` names (`ftz`, `preserve`,
-/// `any`); none by default, which leaves it to the host. (`ftz` made a triangle-edge pattern on
-/// AMD: something the title computes needs its denormals.)
-pub fn denorm_mode() -> Option<&'static str> {
-    static MODE: std::sync::OnceLock<Option<String>> = std::sync::OnceLock::new();
-    MODE.get_or_init(|| {
-        std::env::var("VICTORY_DENORM")
-            .ok()
-            .filter(|v| matches!(v.as_str(), "any" | "preserve" | "ftz"))
-    })
-    .as_deref()
-}
-
 const PARAMATTR_BLOCK: u64 = 9;
 const PARAMATTR_GROUP_BLOCK: u64 = 10;
 const CONSTANTS_BLOCK: u64 = 11;

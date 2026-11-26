@@ -94,12 +94,7 @@ fn parse(set: &str) -> Set {
 
 fn set() -> Set {
     static SET: OnceLock<Set> = OnceLock::new();
-    // (Merged runtime: on by default at 0.8, as avatarmanz's play.ps1 runs
-    // it; `off` or 0 leaves the title's own output.)
-    *SET.get_or_init(|| match std::env::var("VICTORY_AMBIENT") {
-        Ok(v) if !v.trim().is_empty() => parse(&v),
-        _ => Set::Estimate(0.8),
-    })
+    *SET.get_or_init(|| parse(&std::env::var("VICTORY_AMBIENT").unwrap_or_default()))
 }
 
 /// Whether the stand-in is on: set, and the title's rays find nothing.
@@ -408,8 +403,6 @@ void raise(uint3 at : SV_DispatchThreadID) {
     found = clamp(found, 0.2 * all, 2.5 * all);
     found = lerp(found, cells[CELLS].rgb, 0.2) * level * open;
     float3 was = unpack(light[p]);
-    // Magenta (green far below red and blue) is what the probes' memory held, not light.
-    if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
     float left = dot(was, LUMA);
     // What the program left counts as far as it can be true: the sky's light
     // outdoors, not the blocks of other memory.
@@ -438,7 +431,6 @@ const CELLS: u64 = 64 * 36;
 const CELL_BYTES: u64 = (2 * CELLS + 1) * 16;
 const POINT_BYTES: u64 = 160 * 90 * 48;
 /// Where the slow mean is among the cells (float4s).
-#[allow(dead_code)] // (the light probe is not ported)
 pub(crate) const CELLS_AT: u32 = CELLS as u32;
 
 struct Pass {
@@ -509,7 +501,6 @@ fn pass() -> Option<&'static Pass> {
 
 /// The probe's sums and the cells (with the slow mean), once the passes are
 /// made and the stand-in is on.
-#[allow(dead_code)] // (the light probe is not ported)
 pub(crate) fn probe_buffers() -> Option<(ID3D12Resource, ID3D12Resource)> {
     if !on() {
         return None;
@@ -579,8 +570,7 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
     words[8] = follow(role).to_bits();
     words[9] = 4.0f32.to_bits();
     words[10] = air().to_bits();
-    // The light probe of avatarmanz `b4ba4bb` is not ported: its sums off.
-    words[11] = 0;
+    words[11] = u32::from(crate::lightprobe::on());
     words[12] = settle().map_or(0.0, |s| s.jump).to_bits();
     words[13] = settle().map_or(0.0, |s| s.fresh).to_bits();
     words[14] = (frame_ms(role) / 1000.0).to_bits();

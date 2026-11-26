@@ -147,20 +147,16 @@ fn texture(desc: &ResourceDesc) -> Option<Texture> {
         l if l & !0xff == SWIZZLED => Swizzle(l & 0xff),
         _ => return None,
     };
-    let texture = Texture::for_gpu(
-        &TextureDesc {
-            dimension,
-            width: u32::try_from(desc.width).ok()?,
-            height: desc.height,
-            depth_or_array: u32::from(desc.depth_or_array),
-            mips: u32::from(desc.mips),
-            format: desc.format,
-            samples: desc.samples.max(1),
-            swizzle,
-        },
-        victory_gpu::console::current().pipes(),
-        0,
-    )
+    let texture = Texture::new(&TextureDesc {
+        dimension,
+        width: u32::try_from(desc.width).ok()?,
+        height: desc.height,
+        depth_or_array: u32::from(desc.depth_or_array),
+        mips: u32::from(desc.mips),
+        format: desc.format,
+        samples: desc.samples.max(1),
+        swizzle,
+    })
     .ok()?;
     // The layout struct has room for 15 mips.
     (texture.planes[0].layout.mips.len() <= MIPS).then_some(texture)
@@ -669,6 +665,10 @@ mod tests {
         d.flags = ALLOW_DEPTH_STENCIL;
         XGSuggestSwizzleMode(&d, 0, &mut out);
         assert_eq!(out, 0x118);
+        // A 1D texture has no tiled layout, whatever its use.
+        d.dimension = TEXTURE_1D;
+        XGSuggestSwizzleMode(&d, 0, &mut out);
+        assert_eq!(out, 0x100);
     }
 
     /// The title's calls: layout, then a copy in and out of each mip.

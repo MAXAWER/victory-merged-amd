@@ -84,17 +84,8 @@ const PAGE: u64 = 1 << 16;
 const ARENA: u64 = 64 << 20;
 /// What is compared at a time.
 const PIECE: usize = 4096;
-/// Pages held, at most: 3 GiB unless `VICTORY_MEMORY_PAGES_MB` says
-/// otherwise (merged runtime: every page held is 64 KiB of an arena in the
-/// PC's memory, and as much again for its copy's CPU side).
-fn most() -> usize {
-    static MOST: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
-    *MOST.get_or_init(|| {
-        let mb = std::env::var("VICTORY_MEMORY_PAGES_MB").ok().and_then(|v| v.trim().parse::<usize>().ok());
-        // (A megabyte is 16 pages of 64 KiB.)
-        mb.map_or(3 << 14, |mb| (mb << 4).max(SPARE))
-    })
-}
+/// Pages held, at most (3 GiB).
+const MOST: usize = 3 << 14;
 /// Pages of title memory with small title buffers in them, at most.
 const WINDOWS: usize = 512;
 /// The biggest packed structure taken for one.
@@ -187,9 +178,6 @@ struct Memory {
     frame: u64,
     /// Pages asked for this frame that are not the title's memory.
     refused: std::collections::HashSet<u64>,
-    /// (Merged runtime) The frame in which another arena could last not be
-    /// made: not asked again in it.
-    no_arena: u64,
     stats: Stats,
     #[cfg(feature = "diagnostics")]
     dump: dump::Dump,
@@ -237,18 +225,9 @@ impl Memory {
         let bytes = u64::from(MEMORY_PAGES) * 8;
         // Zeroed, and watched for writes as the title's memory is.
         let entries = crate::upload::reserve(bytes as usize)?;
-        // (Merged runtime) What was reserved goes back when the rest cannot
-        // be made: the next frame asks again.
-        let Some(directory) = crate::shadow::by_address(entries as u64, bytes) else {
-            crate::upload::release(entries);
-            return None;
-        };
+        let directory = crate::shadow::by_address(entries as u64, bytes)?;
         crate::host::name(&directory.buffer, || "title memory by address: directory".into());
-        let Some((faults, data)) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4) else {
-            drop(directory);
-            crate::upload::release(entries);
-            return None;
-        };
+        let (faults, data) = host.shared_buffer(u64::from(MEMORY_FAULTS) * 4)?;
         crate::host::name(&faults, || "title memory by address: faults".into());
         // SAFETY: a fresh mapping of at least that many bytes.
         unsafe { std::ptr::write_bytes(data, 0, MEMORY_FAULTS as usize * 4) };
@@ -274,7 +253,6 @@ impl Memory {
             heaps: HashMap::new(),
             frame: u64::MAX,
             refused: Default::default(),
-            no_arena: u64::MAX,
             stats: Stats::default(),
             #[cfg(feature = "diagnostics")]
             dump: Default::default(),
@@ -368,16 +346,14 @@ impl Memory {
                     let entry = self.entry(at / PAGE);
                     // SAFETY: an entry of the directory.
                     if unsafe { entry.read() } == 0 {
-                        // (Merged runtime) `offset`: a copy in place
-                        // (`crate::inplace`) begins before the buffer.
-                        close(entry, n, shadow.offset(at));
+                        close(entry, n, at - first);
                     }
                     at += PAGE;
                 }
             }
             // SAFETY: as above.
             if unsafe { self.entry(page).read() } == 0 {
-                close(self.entry(page), n, shadow.offset(start));
+                close(self.entry(page), n, start - shadow.span().0);
             }
             return true;
         }
@@ -393,9 +369,9 @@ impl Memory {
             }
             return false;
         }
-        if self.pages.len() >= most() {
+        if self.pages.len() >= MOST {
             static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| tracing::warn!(most = most(), "title memory by address: no more pages are taken; others read zeros"));
+            ONCE.call_once(|| tracing::warn!(MOST, "title memory by address: no more pages are taken; others read zeros"));
             return false;
         }
         if let Some((copy, at)) = self.free.pop() {
@@ -414,19 +390,10 @@ impl Memory {
 
     /// Another arena's pages.
     fn another(&mut self) -> bool {
-        // (Merged runtime) Once a frame at most when it fails, and what was
-        // reserved goes back: the builder's every dispatch asks.
-        if self.no_arena == self.frame {
-            return false;
-        }
         let Some(at) = crate::upload::reserve(ARENA as usize) else {
-            self.no_arena = self.frame;
             return false;
         };
         let Some(n) = crate::shadow::by_address(at as u64, ARENA).and_then(|s| self.number(s)) else {
-            // (The copy, if one was made, is gone with `number`'s refusal.)
-            crate::upload::release(at);
-            self.no_arena = self.frame;
             return false;
         };
         self.arenas.push((n, at));
@@ -515,7 +482,7 @@ impl Memory {
         );
         for page in first.div_ceil(PAGE)..(first + len) / PAGE {
             if self.copy_of(page) == Some(n) {
-                fill(self.entry(page), n, self.copies[n].offset(page * PAGE));
+                fill(self.entry(page), n, page * PAGE - first);
             }
         }
     }
@@ -938,22 +905,7 @@ pub(crate) fn ready(
 ) -> Option<Ready> {
     let mut guard = MEMORY.lock().unwrap_or_else(|e| e.into_inner());
     if guard.is_none() {
-        // (Merged runtime) Once a frame at most: it reserves 16 MiB and makes
-        // a copy in the card's memory every time.
-        static TRIED: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
-        let frame = crate::frame::current();
-        if TRIED.swap(frame, std::sync::atomic::Ordering::Relaxed) == frame {
-            return None;
-        }
         *guard = Memory::new();
-        if guard.is_none() {
-            static ONCE: std::sync::Once = std::sync::Once::new();
-            ONCE.call_once(|| {
-                tracing::warn!(
-                    "title memory by address cannot be held (it needs copies in the card's memory, VICTORY_CARD_BUFFERS): the draws and dispatches that read it are dropped"
-                )
-            });
-        }
     }
     let m = guard.as_mut()?;
     let frame = crate::frame::current();
@@ -974,7 +926,7 @@ pub(crate) fn ready(
     if builds && sizes_wait() && asks_size(written, constants, threads) {
         list.first_use(SIZES);
     }
-    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < most() && m.another() {}
+    while builds && m.free.len() < SPARE && m.pages.len() + m.free.len() < MOST && m.another() {}
     m.stats.uses[usize::from(builds)] += 1;
     // Once per list and page named: the builder dispatches hundreds of times
     // a frame with the same arguments.
@@ -1087,8 +1039,8 @@ pub(crate) fn ready(
         }
     };
     for (n, shadow) in m.copies.iter().enumerate().skip(made as usize) {
-        let (start, len) = shadow.span();
-        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, shadow.offset(start) + len);
+        let (_, len) = shadow.span();
+        heap.raw_uav_at(base + 1 + n as u32, &shadow.buffer, 0, len);
     }
     m.heaps.insert(key, (base, m.copies.len() as u32));
     // Every copy by every list that has come to by-address memory, whoever

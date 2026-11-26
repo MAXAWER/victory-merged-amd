@@ -78,9 +78,8 @@ debug = "line-tables-only"
 [profile.diag]
 inherits = "release"
 
-# (Merged runtime) The build to play with: release code generation with
-# whole-program optimisation (`cargo build --profile ship -p victory`; slow to
-# link). The CPU side is the frame's limit, so the translator's own code counts.
+# (Local) The build to play with: whole-program optimisation, one codegen unit.
+# Built with RUSTFLAGS=-C target-cpu=native into its own folder.
 [profile.ship]
 inherits = "release"
 lto = "fat"

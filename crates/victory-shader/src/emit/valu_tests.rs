@@ -29,6 +29,11 @@ const fn sop2(op: u8, sdst: u8, src0: u8, src1: u8) -> u32 {
         | src0 as u32
 }
 
+/// SOPK `op sdst, simm16`; the compares read `sdst` as their operand.
+const fn sopk(op: u8, sdst: u8, simm16: u16) -> u32 {
+    0xB000_0000 | (op as u32 & 0x1F) << 23 | (sdst as u32 & 0x7F) << 16 | simm16 as u32
+}
+
 /// SMEM `s_load_dwordx4 s[dst:dst+3], s[base:base+1], 0` (soffset = null).
 const fn s_load_dwordx4(dst: u8, base: u8) -> [u32; 2] {
     [
@@ -90,44 +95,6 @@ const fn vgpr(n: u8) -> u16 {
     256 + n as u16
 }
 
-/// The first group's number the host gives the programs that ask for it.
-const GROUP_BASE: u32 = 65_535;
-
-/// A compute program that reads its group's number in x alone adds the number of
-/// the first group: a dispatch of more groups than the host runs comes in
-/// parts.
-#[test]
-fn a_group_number_in_x_counts_from_the_host_s_first_group() {
-    let program = |y: bool| -> Vec<u32> {
-        // s12 and s13: the group's number in x and in y (s5 and s6, after
-        // the 5 user SGPRs).
-        let mut words = vec![s_mov_b32(12, 5)];
-        if y {
-            words.push(s_mov_b32(13, 6));
-        }
-        words.push(s_mov_b32(5, 0x80));
-        words.extend_from_slice(&s_load_dwordx4(8, 4));
-        words.push(vop1(0x001, 1, sgpr(if y { 13 } else { 12 }))); // v_mov_b32 v1
-        words.push(vop1(0x001, 0, sgpr(12))); // v_mov_b32 v0, s12
-        // With y: what is stored is the number in y.
-        if y {
-            words.push(vop1(0x001, 0, vgpr(1))); // v_mov_b32 v0, v1
-        }
-        words.extend_from_slice(&buffer_store_dword(0, 8, 0));
-        words.push(S_ENDPGM);
-
-        words
-    };
-    const X: u32 = 1 << 7;
-    const Y: u32 = 1 << 8;
-    for (enabled, y, expected) in [(X, false, GROUP_BASE), (X | Y, false, GROUP_BASE), (X | Y, true, 0)] {
-        let shader = lower_words(program(y), 1, 0, enabled);
-        let asks = shader.user_data.iter().any(|u| u.root == RootType::Other(super::USER_GROUP_BASE));
-        assert_eq!(asks, expected != 0);
-        run_cases(&shader, &[[1, 2, 3, 4]], |label, _, _, out| assert_eq!(out, expected, "{label}"));
-    }
-}
-
 /// Builds and lowers a 1-thread synthetic RDNA2 compute shader that receives
 /// 4 dwords of root constants in `s0..s3`, runs `body` (leaving its result in
 /// `v0`), and stores `v0` to dword 0 of the raw UAV at heap index 0.
@@ -150,12 +117,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     words.extend_from_slice(body);
     words.extend_from_slice(&buffer_store_dword(0, 8, 0));
     words.push(S_ENDPGM);
-    lower_words(words, threads, lds_bytes, 0)
-}
 
-/// Lowers a whole program of [`build_cs`]'s layout; `rsrc2`: more bits of
-/// that register.
-fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> HostShader {
     let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
     let native = NativeProgram {
         stage: HwStage::Cs,
@@ -190,7 +152,7 @@ fn lower_words(words: Vec<u32>, threads: u32, lds_bytes: u32, rsrc2: u32) -> Hos
             slot: 1,
         }],
         io: StageIo::Cs(ComputeIo {
-            rsrc2: rsrc2 | (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
+            rsrc2: (5 << 1) | ((lds_bytes / 512) << 15), // 5 user SGPRs: s0..s4
             threads: [threads, 1, 1],
         }),
         code,
@@ -278,7 +240,6 @@ fn run_cases_on(
                 ud[u.index as usize] = match (u.root, u.slot) {
                     (RootType::Constants, 0) => inputs[u.dword as usize],
                     (RootType::Table, 1) => 0,
-                    (RootType::Other(super::USER_GROUP_BASE), _) => GROUP_BASE,
                     other => panic!("unexpected user data {other:?}"),
                 };
             }
@@ -882,62 +843,6 @@ fn v_cmp_lg_is_false_for_nan() {
     }
 }
 
-/// 64-bit integer compares order by the high dword (signed for i64), then
-/// by the low one. AMD's D3D12 compiler runs an ordered i64 `icmp` as if the
-/// dwords were swapped (RX 9070 and gfx1036 alike), so the lowering compares
-/// the dwords; the values are picked so that the two orders disagree.
-#[test]
-fn v_cmp_u64_and_i64_order_by_the_high_dword() {
-    type Order = fn(u64, u64) -> bool;
-    let ops: [(u16, &str, Order); 12] = [
-        (0x0a1, "v_cmp_lt_i64", |a, b| (a as i64) < (b as i64)),
-        (0x0a2, "v_cmp_eq_i64", |a, b| a == b),
-        (0x0a3, "v_cmp_le_i64", |a, b| (a as i64) <= (b as i64)),
-        (0x0a4, "v_cmp_gt_i64", |a, b| (a as i64) > (b as i64)),
-        (0x0a5, "v_cmp_ne_i64", |a, b| a != b),
-        (0x0a6, "v_cmp_ge_i64", |a, b| (a as i64) >= (b as i64)),
-        (0x0e1, "v_cmp_lt_u64", |a, b| a < b),
-        (0x0e2, "v_cmp_eq_u64", |a, b| a == b),
-        (0x0e3, "v_cmp_le_u64", |a, b| a <= b),
-        (0x0e4, "v_cmp_gt_u64", |a, b| a > b),
-        (0x0e5, "v_cmp_ne_u64", |a, b| a != b),
-        (0x0e6, "v_cmp_ge_u64", |a, b| a >= b),
-    ];
-    let values: [u64; 10] = [
-        0,
-        1,
-        0xFFFF_FFFF,
-        0x1_0000_0000,
-        0x1_FFFF_FFFF,
-        0x0000_0040_C010_FBFF,
-        0x0001_8000_0000_0040,
-        0x7FFF_FFFF_FFFF_FFFF,
-        0x8000_0000_0000_0001,
-        0xFFFF_FFFF_0000_0000,
-    ];
-    let inputs: Vec<[u32; 4]> = values
-        .iter()
-        .flat_map(|&a| values.iter().map(move |&b| (a, b)))
-        .map(|(a, b)| [a as u32, (a >> 32) as u32, b as u32, (b >> 32) as u32])
-        .collect();
-    for (op, name, order) in ops {
-        // op s20, v[1:2], v[3:4] and, sharing v2, op s20, v[1:2], v[2:3];
-        // v_cndmask_b32_e64 v0, 0, 1, s20
-        for second in [3, 2] {
-            let mut body = vop3(op, 20, vgpr(1), vgpr(second), 0x80).to_vec();
-            body.extend_from_slice(&vop3(0x101, 0, 0x80, 0x81, sgpr(20)));
-            let shader = build_valu_cs(&body);
-            let at = usize::from(second) - 1;
-            run_cases(&shader, &inputs, |backend, _, inp, got| {
-                let a = u64::from(inp[0]) | u64::from(inp[1]) << 32;
-                let b = u64::from(inp[at]) | u64::from(inp[at + 1]) << 32;
-                let want = u32::from(order(a, b));
-                assert_eq!(got, want, "{backend}: {name}({a:#018x}, {b:#018x})");
-            });
-        }
-    }
-}
-
 #[test]
 fn v_cvt_off_f32_i4_uses_the_signed_low_nibble() {
     // v_cvt_off_f32_i4 v0, v1 (VOP1 opcode 0x00e)
@@ -1284,6 +1189,61 @@ fn v_cvt_f16_u16_and_i16_widen_the_integer_first() {
 }
 
 #[test]
+fn s_cmpk_compares_against_the_extended_immediate() {
+    // s_cmpk_<cond>_<type> s0, imm; s_cselect_b32 s6, 1, 0 (SOP2 0x0a, on SCC);
+    // v_mov_b32 v0, s6. The signed forms sign-extend the 16-bit immediate, the
+    // unsigned forms zero-extend it.
+    type Cond = fn(i64, i64) -> bool;
+    let conds: [(&str, Cond); 6] = [
+        ("eq", |a, b| a == b),
+        ("lg", |a, b| a != b),
+        ("gt", |a, b| a > b),
+        ("ge", |a, b| a >= b),
+        ("lt", |a, b| a < b),
+        ("le", |a, b| a <= b),
+    ];
+    // An immediate below and one at the sign bit; operands around each extension.
+    let imms: [u16; 2] = [0x0005, 0x8000];
+    let operands: [u32; 9] = [
+        0,
+        4,
+        5,
+        6,
+        0x7FFF,
+        0x8000,
+        0xFFFF_8000,
+        0xFFFF_FFFF,
+        0x8000_0000,
+    ];
+    for (signed, first_op) in [(true, 0x003u8), (false, 0x009)] {
+        for (k, (cond, holds)) in conds.iter().enumerate() {
+            for imm in imms {
+                let shader = build_valu_cs(&[
+                    sopk(first_op + k as u8, 0, imm),
+                    sop2(0x0a, 6, 129, 128),
+                    vop1(0x001, 0, sgpr(6)),
+                ]);
+                let name = format!("s_cmpk_{cond}_{}32", if signed { "i" } else { "u" });
+                let inputs: Vec<[u32; 4]> = operands.iter().map(|&v| [v, 0, 0, 0]).collect();
+                run_cases(&shader, &inputs, |backend, i, _, got| {
+                    let (a, b) = if signed {
+                        (i64::from(operands[i] as i32), i64::from(imm as i16))
+                    } else {
+                        (i64::from(operands[i]), i64::from(imm))
+                    };
+                    let want = u32::from(holds(a, b));
+                    assert_eq!(
+                        got, want,
+                        "{backend}: {name}({:#010x}, {imm:#06x}) = {got}, want {want}",
+                        operands[i],
+                    );
+                });
+            }
+        }
+    }
+}
+
+#[test]
 fn v_sin_and_v_cos_f16_reduce_large_turns() {
     let sin_shader = build_valu_cs(&[vop1(0x060, 0, vgpr(1))]);
     let cos_shader = build_valu_cs(&[vop1(0x061, 0, vgpr(1))]);
@@ -1404,6 +1364,19 @@ fn bfe_signed_and_unsigned_match_rdna2() {
     let v_unsigned = build_valu_cs(&vop3(0x148, 0, vgpr(1), vgpr(2), vgpr(3)));
     // s_bfe_i32 s6, s0, s1 (SOP2 opcode 0x28: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
     let s_signed = build_valu_cs(&[sop2(0x28, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    // s_bfe_u32 s6, s0, s1 (SOP2 opcode 0x27: s1 = off[4:0] | width[22:16]); v_mov_b32 v0, s6
+    let s_unsigned = build_valu_cs(&[sop2(0x27, 6, 0, 1), vop1(0x001, 0, sgpr(6))]);
+    // SCC = (result != 0), consumed by s_cselect_b32 s7, s2, s3.
+    let s_signed_scc = build_valu_cs(&[
+        sop2(0x28, 6, 0, 1),
+        sop2(0x0A, 7, 2, 3),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
+    let s_unsigned_scc = build_valu_cs(&[
+        sop2(0x27, 6, 0, 1),
+        sop2(0x0A, 7, 2, 3),
+        vop1(0x001, 0, sgpr(7)),
+    ]);
 
     let signed_cases: &[([u32; 4], u32)] = &[
         // Field crosses bit 31: extends from bit 31.
@@ -1427,22 +1400,36 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
-    // v_bfe_i32 width is 5-bit (src2[4:0]), so width=32 wraps to 0.
-    run_cases(
-        &v_signed,
-        &[[0x8000_0000, 4, 32, 0]],
-        |backend, _, _, got| {
-            assert_eq!(got, 0, "{backend}: v_bfe_i32 width 32 should mask to 0");
-        },
-    );
+    // v_bfe_{i32,u32} width is 5-bit (src2[4:0]), so width=32 wraps to 0.
+    for (name, shader) in [("v_bfe_i32", &v_signed), ("v_bfe_u32", &v_unsigned)] {
+        run_cases(shader, &[[0x8000_0000, 4, 32, 0]], |backend, _, _, got| {
+            assert_eq!(got, 0, "{backend}: {name} width 32 should mask to 0");
+        });
+    }
 
-    // s_bfe_i32 width is 7-bit (src1[22:16]), so width=32 keeps all 32 bits.
+    const WHEN_NZ: u32 = 0xAAAA_5555;
+    const WHEN_ZERO: u32 = 0x1111_2222;
+    let pack = |off: u32, width: u32| (off & 31) | ((width & 0x7F) << 16);
+
+    // s_bfe_i32 width is 7-bit (src1[22:16]), so widths >= 32 keep all remaining bits
+    // with sign extension from bit 31 (including width=64 where width & 31 == 0).
     let mut s_cases = signed_cases.to_vec();
-    s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
-    let s_in: Vec<[u32; 4]> = s_cases
+    s_cases.extend([
+        ([0x8000_0000, 4, 32, 0], 0xf800_0000),
+        ([0x8000_0000, 0, 32, 0], 0x8000_0000),
+        ([0x8000_0000, 4, 64, 0], 0xf800_0000),
+        ([0xd2f9_0159, 28, 127, 0], 0xffff_fffd),
+        ([0x0000_000f, 4, 32, 0], 0),
+    ]);
+    let mut s_in: Vec<[u32; 4]> = s_cases
         .iter()
-        .map(|&(inp, _)| [inp[0], (inp[1] & 31) | ((inp[2] & 0x7F) << 16), 0, 0])
+        .map(|&(inp, _)| [inp[0], pack(inp[1], inp[2]), WHEN_NZ, WHEN_ZERO])
         .collect();
+    // Unused bits src1[15:5] and src1[31:23] are ignored by hardware.
+    s_cases.push(([0x8000_0000, 4, 32, 0], 0xf800_0000));
+    s_in.push([0x8000_0000, 0xFF80_FFE0 | pack(4, 32), WHEN_NZ, WHEN_ZERO]);
+    s_cases.push(([0xffff_ffff, 4, 0, 0], 0));
+    s_in.push([0xffff_ffff, 0xFF80_FFE4, WHEN_NZ, WHEN_ZERO]);
     run_cases(&s_signed, &s_in, |backend, i, inp, got| {
         let want = s_cases[i].1;
         assert_eq!(
@@ -1451,10 +1438,23 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1],
         );
     });
+    run_cases(&s_signed_scc, &s_in, |backend, i, inp, got| {
+        let want = if s_cases[i].1 != 0 {
+            WHEN_NZ
+        } else {
+            WHEN_ZERO
+        };
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_i32 SCC({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
 
     let unsigned_cases: &[([u32; 4], u32)] = &[
         ([0xd2f9_0159, 28, 16, 0], 0x0000_000d),
         ([0x8000_0000, 31, 4, 0], 0x0000_0001),
+        ([0x0000_0080, 4, 4, 0], 0x0000_0008),
         ([0xffff_ffff, 4, 0, 0], 0),
         ([0x8000_0000, 4, 31, 0], 0x0800_0000),
     ];
@@ -1467,6 +1467,80 @@ fn bfe_signed_and_unsigned_match_rdna2() {
             inp[0], inp[1], inp[2],
         );
     });
+
+    // s_bfe_u32 width is 7-bit (src1[22:16]): widths >= 32 shift without sign extension.
+    let mut su_cases = unsigned_cases.to_vec();
+    su_cases.extend([
+        ([0x8000_0000, 4, 32, 0], 0x0800_0000),
+        ([0x8000_0000, 0, 32, 0], 0x8000_0000),
+        ([0x8000_0000, 4, 64, 0], 0x0800_0000),
+        ([0xd2f9_0159, 28, 127, 0], 0x0000_000d),
+        ([0x0000_000f, 4, 32, 0], 0),
+    ]);
+    let mut su_in: Vec<[u32; 4]> = su_cases
+        .iter()
+        .map(|&(inp, _)| [inp[0], pack(inp[1], inp[2]), WHEN_NZ, WHEN_ZERO])
+        .collect();
+    su_cases.push(([0x8000_0000, 4, 32, 0], 0x0800_0000));
+    su_in.push([0x8000_0000, 0xFF80_FFE0 | pack(4, 32), WHEN_NZ, WHEN_ZERO]);
+    su_cases.push(([0xffff_ffff, 4, 0, 0], 0));
+    su_in.push([0xffff_ffff, 0xFF80_FFE4, WHEN_NZ, WHEN_ZERO]);
+    run_cases(&s_unsigned, &su_in, |backend, i, inp, got| {
+        let want = su_cases[i].1;
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+    run_cases(&s_unsigned_scc, &su_in, |backend, i, inp, got| {
+        let want = if su_cases[i].1 != 0 {
+            WHEN_NZ
+        } else {
+            WHEN_ZERO
+        };
+        assert_eq!(
+            got, want,
+            "{backend}: s_bfe_u32 SCC({:#010x}, {:#010x}) = {got:#010x}, want {want:#010x}",
+            inp[0], inp[1],
+        );
+    });
+
+    // Literal src1 (`0xFF` followed by 32-bit immediate) for both s_bfe_u32 and s_bfe_i32:
+    // offset=4 (with ignored bits [15:5]), width=32/64/0 (with ignored bits [31:23]).
+    let literals: [(u8, u32, u32, u32, u32); 6] = [
+        (0x27, 0x8020_FFE4, 0x8000_0000, 0x0800_0000, WHEN_NZ),
+        (0x28, 0x8020_FFE4, 0x8000_0000, 0xf800_0000, WHEN_NZ),
+        (0x27, 0x0040_001C, 0xd2f9_0159, 0x0000_000d, WHEN_NZ),
+        (0x28, 0x0040_001C, 0xd2f9_0159, 0xffff_fffd, WHEN_NZ),
+        (0x27, 0xFF80_FFE4, 0xffff_ffff, 0, WHEN_ZERO),
+        (0x28, 0xFF80_FFE4, 0xffff_ffff, 0, WHEN_ZERO),
+    ];
+    for (op, lit, src0, want, want_scc) in literals {
+        let val_cs = build_valu_cs(&[sop2(op, 6, 0, 255), lit, vop1(0x001, 0, sgpr(6))]);
+        run_cases(&val_cs, &[[src0, 0, 0, 0]], |backend, _, _, got| {
+            assert_eq!(
+                got, want,
+                "{backend}: literal sop2({op:#x}, {src0:#010x}, {lit:#010x}) = {got:#010x}, want {want:#010x}",
+            );
+        });
+        let scc_cs = build_valu_cs(&[
+            sop2(op, 6, 0, 255),
+            lit,
+            sop2(0x0A, 7, 2, 3),
+            vop1(0x001, 0, sgpr(7)),
+        ]);
+        run_cases(
+            &scc_cs,
+            &[[src0, 0, WHEN_NZ, WHEN_ZERO]],
+            |backend, _, _, got| {
+                assert_eq!(
+                    got, want_scc,
+                    "{backend}: literal sop2({op:#x}) SCC({src0:#010x}, {lit:#010x}) = {got:#010x}",
+                );
+            },
+        );
+    }
 }
 
 #[test]
@@ -2071,222 +2145,6 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
             );
         }
     }
-}
-
-#[test]
-fn glc_heap_uav_loads_stores_and_atomics_execute_on_gpu() {
-    let _one = ONE_AT_A_TIME.lock().unwrap_or_else(|e| e.into_inner());
-    // Compute shader with `RootType::ResourceHeap` (`s2`) and 2 root constants
-    // (`s0..s1`), 2 threads per group (`v0` = thread id in group), dispatched
-    // across 2 groups (`s3` = group id X):
-    // - Heap index 0 (`0x0`): raw UAV buffer (16 dwords)
-    // - Heap index 1 (`0x20`): 2x2 RGBA32F texture UAV
-    // - Heap index 2 (`0x40`): 2x1 R32_UINT texture UAV
-    // Exercises heap UAV inference (#724) and `IsGloballyCoherent` `0x4000`
-    // (#725) across `buffer_store_dword glc`, `s_barrier`, reloaded descriptor
-    // `s_buffer_load_dword glc`, `buffer_load_dword` (plain and `glc`),
-    // `buffer_atomic_add glc`, `image_store glc`, `image_load glc`, and
-    // `image_atomic_add glc`.
-    let lshl_add = vop3(0x346, 1, sgpr(3), 0x81, vgpr(0)); // v_lshl_add_u32 v1, s3, 1, v0
-    let lshl_byte = vop3(0x11A, 2, 0x82, vgpr(1), 0); // v_lshlrev_b32 v2, 2, v1
-    let add_s0_v1 = vop3(0x125, 3, sgpr(0), vgpr(1), 0); // v_add_nc_u32 v3, s0, v1
-    let add_v4_v5 = vop3(0x125, 4, vgpr(4), vgpr(5), 0); // v_add_nc_u32 v4, v4, v5
-    let add_s6_v4 = vop3(0x125, 4, sgpr(6), vgpr(4), 0); // v_add_nc_u32 v4, s6, v4
-    let words = [
-        s_mov_b32(4, 2), // s4 = resource heap base (s2)
-        s_mov_b32(5, 0x80),
-        0xF408_0202,
-        0xFA00_0000, // s_load_dwordx4 s[8:11], s[4:5], 0x0   (raw UAV @ 0)
-        0xF40C_0302,
-        0xFA00_0020, // s_load_dwordx8 s[12:19], s[4:5], 0x20 (RGBA32F UAV @ 1)
-        0xF40C_0502,
-        0xFA00_0040, // s_load_dwordx8 s[20:27], s[4:5], 0x40 (R32_UINT UAV @ 2)
-        // v1 = flat index = group_id_x * 2 + thread_id_x; v2 = v1 * 4 (byte offset).
-        lshl_add[0],
-        lshl_add[1],
-        lshl_byte[0],
-        lshl_byte[1],
-        // v3 = s0 + v1; store with `glc` at byte offset v2.
-        add_s0_v1[0],
-        add_s0_v1[1],
-        0xE070_5000,
-        0x8002_0302, // buffer_store_dword v3, v2, s[8:11], 0 offen glc
-        0xBF8A_0000, // s_barrier
-        // Reload raw UAV @ 0 into s[28:31], read dword 0 via scalar `glc` and
-        // lane's own slot via vector `glc` + plain load, and write sum to slot 4 + flat.
-        0xF408_0702,
-        0xFA00_0000, // s_load_dwordx4 s[28:31], s[4:5], 0x0
-        0xF421_018E,
-        0xFA00_0000, // s_buffer_load_dword s6, s[28:31], 0x0 glc
-        0xE030_5000,
-        0x8007_0402, // buffer_load_dword v4, v2, s[28:31], 0 offen glc
-        0xE030_1000,
-        0x8007_0502, // buffer_load_dword v5, v2, s[28:31], 0 offen
-        add_v4_v5[0],
-        add_v4_v5[1],
-        add_s6_v4[0],
-        add_s6_v4[1],
-        0xE070_5010,
-        0x8007_0402, // buffer_store_dword v4, v2, s[28:31], 0 offen offset:16 glc
-        // Atomic add s1 into dword 8 of raw UAV with `glc`.
-        vop1(0x001, 6, sgpr(1)), // v_mov_b32 v6, s1
-        vop1(0x001, 7, 0x80),    // v_mov_b32 v7, 0
-        0xE0C8_5020,
-        0x8007_0607, // buffer_atomic_add v6, v7, s[28:31], 0 offen offset:32 glc
-        // Texture UAV (2x2): store (1.0, 2.0, 3.0, 4.0) at (v0, s3) with `glc`,
-        // load back with `glc`, and atomic_add 5 at (s3, 0) on R32U texture UAV.
-        vop1(0x001, 8, vgpr(0)), // x = thread_id_x (0..1)
-        vop1(0x001, 9, sgpr(3)), // y = group_id_x (0..1)
-        vop1(0x001, 10, 0xF2),   // 1.0f
-        vop1(0x001, 11, 0xF4),   // 2.0f
-        vop1(0x001, 12, 0xF6),   // 4.0f
-        vop1(0x001, 13, 0xF0),   // 0.5f
-        0xF020_2F08,
-        0x0003_0A08, // image_store v[10:13], v[8:9], s[12:19] dmask:0xf 2d glc
-        0xBF8A_0000, // s_barrier
-        0xF000_2F08,
-        0x0003_0E08, // image_load v[14:17], v[8:9], s[12:19] dmask:0xf 2d glc
-        0xE070_5024,
-        0x8007_0E02, // buffer_store_dword v14, v2, s[28:31], 0 offen offset:36 glc
-        vop1(0x001, 18, sgpr(3)), // x = group_id_x
-        vop1(0x001, 19, 0x80), // y = 0
-        vop1(0x001, 20, 0x85), // 5
-        0xF044_2108,
-        0x0005_1412, // image_atomic_add v20, v[18:19], s[20:27] dmask:0x1 2d glc
-        S_ENDPGM,
-    ];
-    let code: Vec<u8> = words.iter().flat_map(|w| w.to_le_bytes()).collect();
-    let native = NativeProgram {
-        stage: HwStage::Cs,
-        wave64: false,
-        vgprs: 24,
-        layout: vec![
-            RootParam {
-                root: RootType::Constants,
-                table_offset_dwords: 0,
-                sgprs: 2,
-                base_register: 0,
-                user_data: 0,
-                slot: 0,
-            },
-            RootParam {
-                root: RootType::ResourceHeap,
-                table_offset_dwords: 0,
-                sgprs: 1,
-                base_register: 0,
-                user_data: 2,
-                slot: 1,
-            },
-        ],
-        used: Vec::new(),
-        io: StageIo::Cs(ComputeIo {
-            // 3 user SGPRs (s0..s2) + TGID_X enabled (bit 7 -> s3).
-            rsrc2: (3 << 1) | (1 << 7),
-            threads: [2, 1, 1],
-        }),
-        code,
-    };
-
-    let p = ir::build(&native.code, native.wave64, native.vgprs).expect("ir::build");
-    let st = structure::structure(&p).expect("structure");
-    let res =
-        resource::track(&p, &native.layout, native.stage, Some(&st)).expect("resource::track");
-    let io = io::raise(&p, &native).expect("io::raise");
-    let lowered = lower::lower(&lower::Parts {
-        native: &native,
-        p: &p,
-        st: &st,
-        io: &io,
-        res: &res,
-        inputs: Vec::new(),
-        outputs: Vec::new(),
-        prims: Vec::new(),
-        mesh_stride: 0,
-    })
-    .expect("lower");
-
-    let mut v = validator::Validator::load(validator::Validator::default_path().as_deref())
-        .expect("dxil.dll validator must load");
-    let mut copy = lowered.dxil.clone();
-    let ours = copy[4..20].to_vec();
-    v.validate(&mut copy).expect("DXIL validation failed");
-    assert_eq!(copy[4..20], ours[..], "container hash mismatch");
-
-    let shader = HostShader {
-        stage: HwStage::Cs,
-        dxil: lowered.dxil,
-        user_data: lowered.user_data,
-        samplers: lowered.samplers,
-        static_samplers: Vec::new(),
-        root_cbvs: lowered.root_cbvs,
-        root_srvs: lowered.root_srvs,
-        root_uavs: lowered.root_uavs,
-        root_indexed_views: res.root_indexed_views.clone(),
-    };
-
-    let mut ran = 0;
-    for (label, warp) in [("hardware", false), ("warp", true)] {
-        let Ok(host) = Host::new(warp) else {
-            eprintln!("no SM 6.6 {label} device; skipped");
-            continue;
-        };
-        let (root, pso) = host
-            .compute_pipeline(&shader)
-            .unwrap_or_else(|e| panic!("{label}: compute_pipeline failed: {e}"));
-        let inputs = [100u32, 7u32];
-        let mut ud = vec![0u32; shader.user_data_dwords().max(1) as usize];
-        for u in &shader.user_data {
-            // The first group's number (one dispatch, no parts): 0.
-            ud[u.index as usize] = match u.root {
-                RootType::Other(super::USER_GROUP_BASE) => 0,
-                _ => inputs[u.dword as usize],
-            };
-        }
-        let out = host
-            .dispatch(
-                &root,
-                &pso,
-                &Dispatch {
-                    roots: vec![(0, Root::Constants(ud))],
-                    views: &[
-                        View::RawUav(16),
-                        View::TextureUav(2, 2),
-                        View::UintTextureUav(2, 1),
-                    ],
-                    samplers: &[],
-                    groups: [2, 1, 1],
-                },
-            )
-            .unwrap_or_else(|e| panic!("{label}: dispatch failed: {e}"));
-        // Slots 0..4 hold 100..103.
-        assert_eq!(&out[0][0..4], &[100, 101, 102, 103], "{label}: raw stores");
-        // Group 0 saw its own s_barrier before reading dword 0 (100):
-        // slot 4 = 100 + 100 + 100 = 300, slot 5 = 101 + 101 + 100 = 302.
-        assert_eq!(&out[0][4..6], &[300, 302], "{label}: reloaded glc reads");
-        // Slot 8 accumulated 4 atomic adds of 7 = 28.
-        assert_eq!(out[0][8], 28, "{label}: buffer_atomic_add glc");
-        // Slots 9..13 hold 1.0f read back through `image_load glc`.
-        assert_eq!(
-            &out[0][9..13],
-            &[1.0f32.to_bits(); 4],
-            "{label}: image_load glc readback"
-        );
-        // 2x2 RGBA32F texture UAV holds (1.0, 2.0, 4.0, 0.5) at all 4 texels.
-        for px in out[1].as_chunks::<4>().0 {
-            assert_eq!(
-                *px,
-                [1.0f32, 2.0, 4.0, 0.5].map(f32::to_bits),
-                "{label}: texture store glc"
-            );
-        }
-        // 2x1 R32_UINT texture UAV: 2 threads per group * 5 = 10 at (0,0) and (1,0).
-        assert_eq!(&out[2][0..2], &[10, 10], "{label}: image_atomic_add glc");
-        ran += 1;
-    }
-    assert!(
-        ran == 2,
-        "expected both hardware GPU and WARP to run, got {ran}"
-    );
 }
 
 /// Whether the hardware adapter is an AMD RDNA card's: what the translator

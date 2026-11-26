@@ -5,16 +5,13 @@
 
 mod census;
 mod inspect;
-#[cfg(windows)]
-mod prebuild;
+#[cfg(all(windows, feature = "diagnostics"))]
+mod replay;
 mod run;
 mod shader;
 mod translate;
-
-/// (Merged runtime) With the `mimalloc` feature, the layer's own heap.
-#[cfg(feature = "mimalloc")]
-#[global_allocator]
-static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+#[cfg(windows)]
+mod warm;
 
 use std::path::PathBuf;
 
@@ -33,6 +30,7 @@ struct Cli {
 }
 
 #[derive(Subcommand)]
+#[allow(clippy::large_enum_variant)]
 enum Command {
     /// Summarise one PE image: headers, sections, imports, TLS, build id.
     Inspect {
@@ -67,8 +65,8 @@ enum Command {
     /// archives, if uncompressed) and report their layout.
     ShaderInfo {
         paths: Vec<PathBuf>,
-        /// Print one line per container found.
-        #[arg(long)]
+        /// Print one line per container found and show why paths were skipped.
+        #[arg(short, long)]
         verbose: bool,
         /// Also list the decoded native instructions (implies --verbose).
         #[arg(long)]
@@ -76,6 +74,11 @@ enum Command {
     },
     /// Run every shader found (containers, SGD5 files) through the
     /// translator and report what it cannot handle yet.
+    ///
+    /// VICTORY_HOST_WAVE overrides the host wave width, including with --warm.
+    /// VICTORY_HOST_MAX_WAVE is a compatibility alias. When both values are
+    /// valid, VICTORY_HOST_WAVE takes precedence. Zero means unknown width.
+    /// For ordinary translation, VICTORY_HOST_RDNA=1 selects RDNA float settings.
     Translate {
         paths: Vec<PathBuf>,
         /// Check emitted DXIL with dxil.dll's validator (`VICTORY_DXIL`,
@@ -88,8 +91,8 @@ enum Command {
         /// Print one line per program and outcome.
         #[arg(long)]
         list: bool,
-        /// Worker threads (0 uses one worker).
-        #[arg(long, value_parser = parse_jobs)]
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
         jobs: Option<usize>,
         /// Warm the run's shader cache: a file of shader hashes (the 16
         /// hex digits a run's log names a shader by, anywhere in a line);
@@ -98,11 +101,43 @@ enum Command {
         /// `VICTORY_VIEW_LIMIT` to what the run's log says of the host.
         #[arg(long)]
         warm: Option<PathBuf>,
-        /// With --pipelines: fill the shader cache and host pipeline
-        /// library `run` reads with every pipeline of the title's shader
-        /// pack (resumable; honours VICTORY_SKIP_PIPELINES).
-        #[arg(long, requires = "pipelines", conflicts_with_all = ["validate", "list", "warm"])]
-        cache: bool,
+    },
+    /// Translate every shader found (as `translate` finds them) into the
+    /// shader cache, so that no run has to: a few minutes, once per version
+    /// of the translator. Translations an earlier build of the same version
+    /// cached are made again, and those that came out different counted.
+    /// In diagnostics builds, VICTORY_LOG=debug shows skipped paths.
+    Shaders {
+        paths: Vec<PathBuf>,
+        /// Worker threads (default: every logical core).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// Also write every shader that does not translate to this file,
+        /// one line each: hash, where it was found, why.
+        #[arg(long)]
+        list: Option<PathBuf>,
+    },
+    /// Make the host pipelines of every pipeline the title ever created
+    /// (runs with `VICTORY_PIPELINE_BOOK=1` write them down), so that the
+    /// driver's cache on disk has them before a run needs one: once per change
+    /// of the translator or the driver. Goes on where it was stopped.
+    #[cfg(windows)]
+    Warm {
+        /// Processes at once (default: two thirds of the logical cores).
+        #[arg(long)]
+        jobs: Option<usize>,
+        /// At most this many pipelines.
+        #[arg(long)]
+        limit: Option<usize>,
+        /// Those made before too.
+        #[arg(long)]
+        again: bool,
+        /// Only the pipelines earlier runs drew with.
+        #[arg(long)]
+        used: bool,
+        /// (What the processes it starts are given.)
+        #[arg(long, hide = true)]
+        these: Option<String>,
     },
     /// Prepare, map and bind a title executable; with --execute, run it.
     Run {
@@ -124,6 +159,10 @@ enum Command {
         #[arg(last = true)]
         title_args: Vec<String>,
     },
+    /// Run a captured frame's GPU work again (diagnostics builds; see
+    /// docs/replay.md).
+    #[cfg(all(windows, feature = "diagnostics"))]
+    Replay(replay::Replay),
     /// Show the resolved configuration and check it.
     Config,
 }
@@ -138,10 +177,6 @@ enum Unimplemented {
 enum Console {
     SeriesX,
     SeriesS,
-}
-
-fn parse_jobs(value: &str) -> std::result::Result<usize, std::num::ParseIntError> {
-    value.parse::<usize>().map(|jobs| jobs.max(1))
 }
 
 fn main() -> Result<()> {
@@ -169,13 +204,6 @@ fn main() -> Result<()> {
             verbose,
             disasm,
         } => shader::run(paths, verbose || disasm, disasm),
-        #[cfg(windows)]
-        Command::Translate {
-            paths,
-            jobs,
-            cache: true,
-            ..
-        } => prebuild::run(paths, jobs),
         Command::Translate {
             paths,
             validate,
@@ -183,29 +211,37 @@ fn main() -> Result<()> {
             list,
             jobs,
             warm,
-            ..
         } => {
             // `VICTORY_VIEW_LIMIT=<null slot>`: translate as on a host whose view heap is capped
             if let Some(n) = std::env::var("VICTORY_VIEW_LIMIT").ok().and_then(|v| v.parse().ok()) {
                 victory_shader::emit::set_view_heap_limit(n);
             }
-            // `VICTORY_HOST_WAVE=32`: translate as for a GPU whose waves are at most 32 lanes
-            if let Some(n) = std::env::var("VICTORY_HOST_WAVE").ok().and_then(|v| v.parse().ok()) {
-                victory_shader::emit::set_host_max_wave(n);
-            }
+            let wave = translate::host_wave::select(
+                std::env::var("VICTORY_HOST_WAVE").ok().as_deref(),
+                std::env::var("VICTORY_HOST_MAX_WAVE").ok().as_deref(),
+                |message| eprintln!("{message}"),
+            );
             if let Some(file) = warm {
-                return translate::warm(paths, &file, jobs);
+                return translate::warm(paths, &file, jobs, wave);
             }
-            translate::run(paths, validate, pipelines, list, jobs)
+            translate::run(paths, validate, pipelines, list, jobs, wave)
         }
+        Command::Shaders { paths, jobs, list } => translate::precompile(paths, jobs, list),
+        #[cfg(windows)]
+        Command::Warm { jobs, limit, again, used, these } => warm::run(jobs, limit, again, used, these),
         Command::Run {
             exe,
             unimplemented,
             strict,
             execute,
             console,
-            title_args: _,
-        } => run::run(&exe, unimplemented, strict, execute, console),
+            title_args,
+        } => {
+            victory_hle::runtime::set_title_args(title_args);
+            run::run(&exe, unimplemented, strict, execute, console)
+        }
+        #[cfg(all(windows, feature = "diagnostics"))]
+        Command::Replay(options) => replay::run(options),
         Command::Config => show_config(),
     }
 }
@@ -254,32 +290,4 @@ pub(crate) fn default_paths(paths: Vec<PathBuf>) -> Result<Vec<PathBuf>> {
         "no paths given and none configured (see victory.example.toml)"
     );
     Ok(all)
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn translate_warm_and_cache_are_separate_modes() {
-        let args = ["victory", "translate"];
-        assert!(Cli::try_parse_from(args.into_iter().chain(["--warm", "all"])).is_ok());
-        assert!(Cli::try_parse_from(args.into_iter().chain(["--cache", "--pipelines"])).is_ok());
-        let result = Cli::try_parse_from(args.into_iter().chain(["--warm", "all", "--cache", "--pipelines"]));
-        assert_eq!(result.err().unwrap().kind(), clap::error::ErrorKind::ArgumentConflict);
-    }
-
-    #[test]
-    fn translate_normalizes_only_explicit_zero_jobs() {
-        for (args, expected) in [
-            (vec!["victory", "translate"], None),
-            (vec!["victory", "translate", "--jobs", "0"], Some(1)),
-            (vec!["victory", "translate", "--jobs", "8"], Some(8)),
-        ] {
-            let Command::Translate { jobs, .. } = Cli::try_parse_from(args).unwrap().command else {
-                unreachable!()
-            };
-            assert_eq!(jobs, expected);
-        }
-    }
 }

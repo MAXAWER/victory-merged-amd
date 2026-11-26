@@ -87,16 +87,6 @@ pub(crate) fn reserve(len: usize) -> Option<usize> {
     (at != 0).then_some(at)
 }
 
-/// (Merged runtime) Gives back memory of [`reserve`] that nothing was made
-/// of (`crate::memory`: its directory or an arena whose copy could not be
-/// made, which leaked before).
-pub(crate) fn release(at: usize) {
-    use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
-    // SAFETY: a reservation of `reserve`'s that nothing reads or writes any
-    // more (the copy of it is gone, or was never made).
-    unsafe { VirtualFree(at as *mut _, 0, MEM_RELEASE) };
-}
-
 impl Upload {
     pub(crate) fn new(len: usize) -> Option<Upload> {
         if !low() {

@@ -1,5 +1,5 @@
-//! Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE`; on by
-//! default in the merged runtime, `0` off). The card stands idle half of every frame, some thirty times for
+//! Keeps the card's clocks up between submissions (`VICTORY_CARD_AWAKE=1`; off
+//! by default). The card stands idle half of every frame, some thirty times for
 //! a millisecond or two each, while the CPU prepares the next submission. The
 //! driver takes that for a light load and lowers the clocks, and what comes
 //! next starts slow: a captured frame whose lists take 30 ms sent in one go
@@ -8,8 +8,9 @@
 //!
 //! One group of 64 threads counts on a compute queue, over and
 //! over: it takes one or two of the card's few thousand wave slots, and the
-//! card is never idle. Nothing is sent once no submission has gone out for a
-//! while (a menu at 30 fps, a minimized window).
+//! card is never idle. Nothing is sent once no submission has gone out for
+//! a quarter of a second (a title that stands still; not a menu, which goes on
+//! drawing: the system's counter shows the compute queue at 100 % there too).
 
 use std::sync::OnceLock;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
@@ -62,13 +63,10 @@ enum Mode {
 
 fn mode() -> Mode {
     static MODE: OnceLock<Mode> = OnceLock::new();
-    // (Merged runtime) On by default: on the RX 9070 XT it took the frame
-    // from 126 to 113 ms and the settles' wait for the card from 49 to
-    // 32 ms (run lockfix_awake_turns, 26 November). `0`: off.
     *MODE.get_or_init(|| match std::env::var("VICTORY_CARD_AWAKE").as_deref() {
-        Ok("0") => Mode::Off,
+        Ok("1") => Mode::On,
         Ok("turns") => Mode::ByTurns,
-        _ => Mode::On,
+        _ => Mode::Off,
     })
 }
 
@@ -203,5 +201,52 @@ fn run(device: &ID3D12Device, wanted: &dyn Fn() -> bool, stop: &AtomicBool) -> w
         }
         let _ = CloseHandle(event);
         result
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Card memory the CPU maps holds what the CPU wrote, with the card kept
+    /// awake meanwhile; the thread ends when it is let go.
+    #[test]
+    fn mapped_card_memory_is_written_by_the_cpu_and_read_by_the_card() {
+        let Some(host) = crate::host::host() else {
+            return;
+        };
+        let awake = start(&host.device, || true);
+        assert!(awake.is_some());
+        let Some((buffer, data)) = host.mapped_card_buffer(4096, true) else {
+            return;
+        };
+        let (seen, back) = host.shared_buffer(4096).unwrap();
+        // SAFETY: mappings of 4096 bytes; a list, a queue and a fence of the
+        // test's own, and nothing is read before the copy has run.
+        let read = unsafe {
+            for i in 0..4096 {
+                data.add(i).write((i * 7 + i / 251) as u8);
+            }
+            let device = &host.device;
+            let queue: ID3D12CommandQueue = device
+                .CreateCommandQueue(&D3D12_COMMAND_QUEUE_DESC {
+                    Type: D3D12_COMMAND_LIST_TYPE_DIRECT,
+                    ..Default::default()
+                })
+                .unwrap();
+            let allocator: ID3D12CommandAllocator = device.CreateCommandAllocator(D3D12_COMMAND_LIST_TYPE_DIRECT).unwrap();
+            let list: ID3D12GraphicsCommandList =
+                device.CreateCommandList(0, D3D12_COMMAND_LIST_TYPE_DIRECT, &allocator, None).unwrap();
+            list.CopyBufferRegion(&seen, 0, &buffer, 0, 4096);
+            list.Close().unwrap();
+            queue.ExecuteCommandLists(&[Some(list.cast().unwrap())]);
+            let fence: ID3D12Fence = device.CreateFence(0, D3D12_FENCE_FLAG_NONE).unwrap();
+            queue.Signal(&fence, 1).unwrap();
+            // No event: returns when the fence is there.
+            fence.SetEventOnCompletion(1, windows::Win32::Foundation::HANDLE::default()).unwrap();
+            std::slice::from_raw_parts(back, 4096).to_vec()
+        };
+        assert!(read.iter().enumerate().all(|(i, &b)| b == (i * 7 + i / 251) as u8));
+        drop(awake);
     }
 }
