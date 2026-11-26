@@ -728,6 +728,18 @@ pub(crate) fn title_written(texture: &ID3D12Resource) -> bool {
 /// submission if the memory changed. Leaves the texture in the copy
 /// destination state.
 pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) {
+    #[cfg(feature = "diagnostics")]
+    let _upload_part = crate::copystat::scope("texture upload check (all)");
+    // (Merged runtime) Once per list and texture: the list's own set first,
+    // the process-wide set of host-written textures only at the first use.
+    // Every draw's texture views came here, and the title's recording
+    // threads met at that one lock for each of them. Marking a host-written
+    // texture as asked about in the list changes nothing: the answer stays
+    // "keep the host's contents" (the set only grows), and nothing else
+    // reads the mark of a texture.
+    if !list.first_use(resource as usize) {
+        return;
+    }
     let host_written = HOST_WRITTEN
         .lock()
         .unwrap_or_else(|e| e.into_inner())
@@ -735,7 +747,7 @@ pub(crate) fn upload(list: &HostList, resource: This, texture: &ID3D12Resource) 
         .is_some_and(|set| set.contains(&(resource as usize)));
     // shortcut: a texture the host copied into keeps the host's contents
     // even if the title later writes its memory too.
-    if host_written || !list.first_use(resource as usize) {
+    if host_written {
         return;
     }
     let Some(staging) = staging(resource, texture) else {

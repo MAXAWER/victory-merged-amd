@@ -1356,3 +1356,75 @@ pub(crate) fn log(frames: f64) {
         );
     }
 }
+
+/// (Merged runtime, diagnostics) Where the time inside list calls goes: by
+/// place, a list method's call of `with_state` (its line in `list.rs`) or a
+/// named part of the draw path ([`scope`]); calls and nanoseconds, summed
+/// over the recording threads. Kept per thread and handed over every 4,096
+/// adds, so the threads do not meet at a lock on every call.
+type Places = HashMap<(&'static str, u32), (u64, u64)>;
+static PLACES: Mutex<Option<Places>> = Mutex::new(None);
+
+thread_local! {
+    static MY_PLACES: std::cell::RefCell<(Places, u32)> = std::cell::RefCell::new((HashMap::new(), 0));
+}
+
+/// Adds `ns` to place `(name, line)`.
+pub(crate) fn place_took(name: &'static str, line: u32, ns: u64) {
+    MY_PLACES.with(|m| {
+        let mut m = m.borrow_mut();
+        let e = m.0.entry((name, line)).or_insert((0, 0));
+        e.0 += 1;
+        e.1 += ns;
+        m.1 += 1;
+        if m.1 >= 4096 {
+            m.1 = 0;
+            let mine = std::mem::take(&mut m.0);
+            let mut all = PLACES.lock().unwrap_or_else(|e| e.into_inner());
+            let all = all.get_or_insert_with(HashMap::new);
+            for (k, (n, t)) in mine {
+                let e = all.entry(k).or_insert((0, 0));
+                e.0 += n;
+                e.1 += t;
+            }
+        }
+    });
+}
+
+/// A named part of the draw path, timed until it is dropped.
+pub(crate) struct Scope(&'static str, std::time::Instant);
+
+impl Drop for Scope {
+    fn drop(&mut self) {
+        place_took(self.0, 0, self.1.elapsed().as_nanos() as u64);
+    }
+}
+
+/// Times the part `name` until the returned guard is dropped.
+pub(crate) fn scope(name: &'static str) -> Scope {
+    Scope(name, std::time::Instant::now())
+}
+
+/// With the frame line: the places that took the most, per frame.
+pub(crate) fn places_line(frames: f64) {
+    let counted = COUNT[C::Frames as usize].load(Relaxed);
+    let frames = if counted > 0 { counted as f64 } else { frames };
+    let taken = PLACES.lock().unwrap_or_else(|e| e.into_inner()).take();
+    let Some(all) = taken else {
+        return;
+    };
+    let mut rows: Vec<_> = all.into_iter().collect();
+    rows.sort_by_key(|r| std::cmp::Reverse(r.1.1));
+    let text: Vec<String> = rows
+        .iter()
+        .take(28)
+        .map(|((name, line), (n, ns))| {
+            let place = if *line > 0 { format!("{name}:{line}") } else { (*name).to_owned() };
+            format!("{place} {:.2} ms in {:.0} calls ({:.1} us)", *ns as f64 / 1e6 / frames, *n as f64 / frames, *ns as f64 / 1e3 / (*n).max(1) as f64)
+        })
+        .collect();
+    tracing::info!("time inside list calls by place, per frame (all recording threads): {}", text.join("; "));
+    let [quick, locked] =
+        [0, 1].map(|i| crate::descriptor::host::MIRRORED_QUICK[i].swap(0, Relaxed) as f64 / frames);
+    tracing::info!("heap slots mirrored per frame: {quick:.0} on the quick path, {locked:.0} under the heap's lock (VICTORY_MIRROR_QUICK)");
+}

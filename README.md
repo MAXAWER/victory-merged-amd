@@ -18,14 +18,17 @@ Windows 11, Series S profile with FSR 4 (FidelityFX SDK 2.4).
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| Opening scenes, in the world | **about 10 fps** (99-103 ms a frame); was 4.4 fps before the merges |
+| Opening scenes, in the world | **about 11 fps** (84-92 ms a frame in the quieter parts, 12 fps at best); was 10 fps this morning and 4.4 fps before the merges |
 | Picture | lit, textured; the indirect light is estimated from the frame (no blocks of stale probe memory); skin in shadow is still too dark without ray tracing |
 | Stability | 7-15 minute runs without a crash; the device losses in the meshlet culling are fixed (raw twins) |
 | Memory | about 21 GB private, pagefile 32-48 GB recommended with 16 GB of RAM |
 
-The frame is bound by the CPU side (preparing submissions, about 60 ms) and by
-memory: with 16 GB of RAM the title pages. A second memory stick is the single
-biggest gain on such a PC.
+The frame is bound by the CPU side: the title's five recording threads in the
+translation of their draw calls (descriptor tables), and the one thread that
+prepares submissions (copies of title memory, about 38 ms a frame). The card is
+about half busy. With 16 GB of RAM Windows compresses some 5 GB of the title's
+memory and the world's loading pages heavily: a second memory stick is the
+single biggest gain on such a PC.
 
 ## What is merged
 
@@ -44,14 +47,25 @@ Each entry names its source; details, conflicts and measurements are in
 - **[Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD)**: the guard
   against the AMD shader compiler crashing on RDNA4, the magenta filter, the ambient stand-in.
 - **[DexNom/VIctory](https://github.com/DexNom/VIctory)**: shader fixes (quad reads, cube
-  gradients, vertex output interpolation).
+  gradients, vertex output interpolation); disjoint refresh spans (PR #20, off here: slower on
+  this PC).
+- **victory-fork** also: the per-thread lookup cache of buffer copies (PR #1237) and the light
+  refresh of view memory; the step index is ported but off (slower on this PC).
+- **avatarmanz** also: keeping the card's clocks up between submissions (`VICTORY_CARD_AWAKE`,
+  on), the 64 KiB cap on constant buffer views.
+- **ccs03**: the present that waits for the one before it (ported, off by default here:
+  `VICTORY_ASYNC_PRESENT_WAIT_MS`), write-watch lock patches (kept aside).
 - **Neptune (VIctory Edit.)**: VRAM-only windows, mouse and keyboard.
 - Also: Geckomacabre/vx-layer, MiamiGame/XTP, Itsbatt/victory-unified, JoshuuDev/victory-amd.
 
 Own work in this tree (see PORTING.md): VRAM-only windows ported to this base, pageable CPU
 sides of card copies, texture staging release, a memory census, card-merge check mode, a reaper
 thread, descriptor-heap sync beside the preparing, async present of multi-plane frames, a
-pre-build that survives the RDNA4 compiler's random crashes, scripted keys.
+pre-build that survives the RDNA4 compiler's random crashes, scripted keys; and, after timing
+every list call by place: a lock-free quick path for descriptor slots made from the same
+record (the heap's lock was 160-190 ms a frame of waiting over the recording threads), a striped
+table of what slots hold, the texture check without the global lock, and in-run A/B switches
+(`alt`) for the experiments.
 
 ## Build
 

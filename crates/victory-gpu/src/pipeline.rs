@@ -139,10 +139,15 @@ impl Shader {
 #[cfg(windows)]
 pub(crate) struct Translated {
     pub(crate) host: victory_shader::emit::HostShader,
+    /// A compute program's threads in a group.
+    pub(crate) threads: Option<[u32; 3]>,
     pub(crate) used: Vec<victory_shader::UsedResource>,
     /// Whether the shader's code can store to buffer memory ([`stores`]);
     /// true when its code is not known.
     pub(crate) stores: bool,
+    /// Whether it can store through raw addresses ([`stores_by_address`];
+    /// avatarmanz ba509c5a).
+    pub(crate) stores_by_address: bool,
 }
 
 #[cfg(windows)]
@@ -233,6 +238,11 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         None => crate::shader_cache::host_shader(container)?,
     };
     let stores = programs.is_empty() || programs.iter().any(stores);
+    let threads = programs.iter().find_map(|p| match &p.io {
+        victory_shader::native::StageIo::Cs(cs) if cs.threads.iter().all(|&n| n > 0) => Some(cs.threads),
+        _ => None,
+    });
+    let stores_by_address = programs.is_empty() || programs.iter().any(stores_by_address);
     let used = programs
         .into_iter()
         .find(|p| {
@@ -243,7 +253,13 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
         })
         .map(|p| p.used)
         .unwrap_or_default();
-    Ok(Translated { host, used, stores })
+    Ok(Translated {
+        host,
+        threads,
+        used,
+        stores,
+        stores_by_address,
+    })
 }
 
 /// The compute pipelines of the console's ray-tracing structure builder
@@ -257,10 +273,21 @@ fn translate(container: &[u8]) -> Result<Translated, String> {
 /// submission, on pointers that had become bounding-box bit patterns).
 ///
 /// So a builder dispatch runs only while every builder pipeline the title
-/// has created has a host pipeline; the first builder dispatch makes them
-/// all on the spot instead of over the next frames (a stage "still being
-/// made" would be a dropped stage). One that cannot be made turns the
-/// builder off for the rest of the run.
+/// has created has a host pipeline (a stage "still being made" would be a
+/// dropped stage). While one cannot be made the builder is off; it is looked
+/// at again when the title creates another. A stage that could not be bound
+/// stops the stages after it for the rest of that frame and the next
+/// ([`builder_rests`]); it turned the builder off for the rest of the run at
+/// first (avatarmanz b558934d).
+///
+/// (Merged runtime) The pipelines not made yet are made by the pipeline
+/// workers, which the driver's compiler guard watches, and the builder waits
+/// for them with none of its stages running (after LNX 1999b065): avatarmanz
+/// made them all on the spot, on the thread of the first builder dispatch,
+/// where a compiler crash of AMD's driver is not caught and a frame waits
+/// for all of them (`VICTORY_BVH_MAKE_NOW=1`: so). Once it may run again it
+/// starts at a frame's first builder dispatch, not midway through a frame
+/// whose earlier stages did not run.
 ///
 /// shortcut: and only with `VICTORY_BVH_BUILDER=1`, until a run has shown
 /// the whole builder and the host side of title memory by address
@@ -271,16 +298,35 @@ struct Builder {
     pipelines: Vec<Arc<make::Pending>>,
     /// Every one of `pipelines` has a host pipeline.
     whole: bool,
-    /// One could not be made.
-    off: bool,
+    /// One could not be made, of so many (0: none).
+    off: usize,
+    /// No stage runs before this frame.
+    rests: u64,
+    /// (Merged runtime) The frame of the last builder dispatch that did not
+    /// run (`u64::MAX`: none yet).
+    refused: u64,
+    /// (Merged runtime) When the pipelines still being made were last named.
+    waited: Option<std::time::Instant>,
 }
 
 #[cfg(windows)]
 static BUILDER: Mutex<Builder> = Mutex::new(Builder {
     pipelines: Vec::new(),
     whole: false,
-    off: false,
+    off: 0,
+    rests: 0,
+    refused: u64::MAX,
+    waited: None,
 });
+
+/// `VICTORY_BVH_MAKE_NOW=1`: the builder's pipelines not made yet are made
+/// all on the spot by its first dispatch, as avatarmanz has it, not by the
+/// workers ([`Builder`]).
+#[cfg(windows)]
+fn builder_make_now() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_MAKE_NOW").is_some_and(|v| v == "1"))
+}
 
 /// Whether `shaders` are a pipeline of the structure builder.
 #[cfg(windows)]
@@ -399,39 +445,95 @@ pub(crate) fn is_builder(this: This) -> bool {
     !this.is_null() && pipeline(this).builder
 }
 
-/// A stage of the builder was dropped after all: none runs from here on.
+/// A stage of the builder was dropped after all: none runs for the rest of
+/// this frame and the next (what it fed is not there).
 #[cfg(windows)]
-pub(crate) fn builder_off(why: &'static str) {
+pub(crate) fn builder_rests(why: &'static str) {
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if !b.off {
-        b.off = true;
-        tracing::warn!(why, "the ray-tracing structure builder is turned off for the rest of the run: its stages run all or none");
+    b.rests = crate::frame::current() + 2;
+    static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+    if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+        tracing::warn!(why, "the ray-tracing structure builder rests for this frame and the next: its stages run all or none");
     }
+}
+
+/// Whether the structure builder may run at all (`VICTORY_BVH_BUILDER=1`;
+/// see [`Builder`]).
+#[cfg(windows)]
+pub(crate) fn builder_allowed() -> bool {
+    static ALLOWED: OnceLock<bool> = OnceLock::new();
+    *ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1"))
 }
 
 /// At a dispatch of a builder pipeline: whether the builder runs (see
 /// [`Builder`]).
 #[cfg(windows)]
 pub(crate) fn builder_runs() -> bool {
-    static ALLOWED: OnceLock<bool> = OnceLock::new();
-    if !*ALLOWED.get_or_init(|| std::env::var_os("VICTORY_BVH_BUILDER").is_some_and(|v| v == "1")) {
+    if !builder_allowed() {
         return false;
     }
+    let frame = crate::frame::current();
     let mut b = BUILDER.lock().unwrap_or_else(|e| e.into_inner());
-    if b.off {
+    if b.off == b.pipelines.len() || frame < b.rests {
+        b.refused = frame;
         return false;
     }
     if b.whole {
         return true;
     }
-    let missing = b.pipelines.iter().filter(|p| !make::now(p)).count();
-    if missing > 0 {
-        b.off = true;
+    // Whether each has a host pipeline: made, cannot be made, or (`None`)
+    // still being made by the workers. (Merged runtime) One the run leaves
+    // out (`VICTORY_SKIP_PIPELINES`, or it crashed the driver's compiler in a
+    // pre-build: [`is_skipped`]) is never dispatched, a stage that would be
+    // dropped while the others run.
+    let made: Vec<Option<bool>> = b
+        .pipelines
+        .iter()
+        .map(|p| {
+            if skipped_shader(make::shaders(p)).is_some() || library::crashed(&p.key) {
+                Some(false)
+            } else if builder_make_now() {
+                Some(make::now(p))
+            } else {
+                make::asked(p)
+            }
+        })
+        .collect();
+    let missing: Vec<String> = b
+        .pipelines
+        .iter()
+        .zip(&made)
+        .filter(|(_, made)| **made == Some(false))
+        .map(|(p, _)| make::hashes(p))
+        .collect();
+    if !missing.is_empty() {
+        b.off = b.pipelines.len();
+        b.refused = frame;
         tracing::warn!(
-            missing,
+            missing = missing.len(),
             of = b.pipelines.len(),
+            which = ?missing,
             "the ray-tracing structure builder stays off: not all of its programs have a host pipeline, and its stages run all or none"
         );
+        return false;
+    }
+    let pending = made.iter().filter(|made| made.is_none()).count();
+    if pending > 0 {
+        b.refused = frame;
+        if b.waited.is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(10)) {
+            b.waited = Some(std::time::Instant::now());
+            tracing::info!(
+                pending,
+                of = b.pipelines.len(),
+                "the ray-tracing structure builder waits: some of its programs' pipelines are still being made, and its stages run all or none"
+            );
+        }
+        return false;
+    }
+    b.off = 0;
+    if b.refused == frame {
+        // All there now, midway through a frame whose earlier stages did not
+        // run: from the next frame's first.
         return false;
     }
     tracing::info!(
@@ -468,6 +570,23 @@ fn stores(program: &victory_shader::NativeProgram) -> bool {
             Encoding::Sop1 => name.is_none_or(|n| matches!(n, "s_setpc_b64" | "s_swappc_b64")),
             _ => false,
         }
+    })
+}
+
+/// Whether a console program can store to memory through raw addresses
+/// (`crate::memory`): a flat or global store or atomic, or code that does
+/// not decode. The programs that only walk ray-tracing structures do not,
+/// whatever they store through views.
+#[cfg(windows)]
+fn stores_by_address(program: &victory_shader::NativeProgram) -> bool {
+    use victory_shader::gfx10::{Encoding, decode};
+    let Ok(code) = decode(&program.code) else {
+        return true;
+    };
+    code.iter().any(|i| {
+        matches!(i.encoding, Encoding::Flat | Encoding::Global)
+            && i.name()
+                .is_none_or(|n| (n.contains("store") || n.contains("atomic")) && !n.contains("scratch"))
     })
 }
 

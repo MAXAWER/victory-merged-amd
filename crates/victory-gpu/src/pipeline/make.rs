@@ -321,6 +321,17 @@ pub(crate) fn missing(p: &Pending) -> Option<String> {
     }
 }
 
+/// The shaders `p` is made of.
+pub(crate) fn shaders(p: &Pending) -> &[Arc<Shader>] {
+    &p.shaders
+}
+
+/// The hashes of the shaders `p` is made of.
+pub(crate) fn hashes(p: &Pending) -> String {
+    let hashes: Vec<&str> = p.shaders.iter().map(|s| s.hash.as_str()).collect();
+    hashes.join("+")
+}
+
 /// Signalled whenever a worker has made a pipeline.
 static DONE: (Mutex<()>, Condvar) = (Mutex::new(()), Condvar::new());
 
@@ -398,6 +409,20 @@ pub(crate) fn ready(p: &Arc<Pending>) -> Option<&HostPipeline> {
 pub(crate) fn now(p: &Arc<Pending>) -> bool {
     p.make();
     p.made.get().is_some_and(|made| made.is_some())
+}
+
+/// Whether `p` has a host pipeline, without waiting: `Some(true)` made,
+/// `Some(false)` it cannot be, `None` still being made (queued for the
+/// workers now if it was not). For the ray-tracing structure builder, which
+/// waits for all of its pipelines ([`super::builder_runs`]).
+pub(crate) fn asked(p: &Arc<Pending>) -> Option<bool> {
+    if !p.used.load(Ordering::Relaxed) && !p.used.swap(true, Ordering::Relaxed) {
+        super::library::note_used(&p.key);
+    }
+    if p.made.get().is_none() {
+        start(p, REQUESTED);
+    }
+    p.made.get().map(Option::is_some)
 }
 
 /// At the title's creation of a pipeline: starts it at once if an earlier

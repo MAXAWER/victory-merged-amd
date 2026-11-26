@@ -31,6 +31,16 @@ pub(crate) struct HostHeap {
     twins: Vec<std::sync::atomic::AtomicBool>,
     /// The record (view index and generation) each slot was last made from.
     made: Mutex<Vec<u64>>,
+    /// (Merged runtime) `made` as the draws read it without its lock: each
+    /// slot's record, set (Release) once the slot's host descriptor is made
+    /// from it, 0 while it is not. Written only under `made`'s lock, always
+    /// together with `made` (`set_made`); read by [`HostHeap::mirror`]'s
+    /// quick path. Every table entry of every draw took `made`'s lock from
+    /// the title's five recording threads at once, and the heap's syncing
+    /// threads beside them: 178 ms a frame of waiting for it, summed over
+    /// the threads (diagnostics run "diag_cache_alt", 26 November).
+    /// `VICTORY_MIRROR_QUICK=0`: every mirror takes the lock, as before.
+    made_quick: Vec<std::sync::atomic::AtomicU64>,
     /// A fingerprint of the record each slot held when the pass over
     /// records copied in as bytes last looked at it
     /// ([`HostHeap::mirror_copied`]; 0: never looked at). Made on first use.
@@ -39,7 +49,12 @@ pub(crate) struct HostHeap {
     /// index heaps directly, so a slot the title has not rewritten since it
     /// released the resource may still be read, and a freed host resource
     /// read there is a GPU page fault (the console reads stale memory).
-    kept: Mutex<Vec<Option<ID3D12Resource>>>,
+    /// (Merged runtime) In [`KEPT_STRIPES`] stripes, each behind its own
+    /// lock: slot `i` is at place `i / KEPT_STRIPES` of stripe
+    /// `i % KEPT_STRIPES` ([`HostHeap::kept_slot`]). One lock for all of
+    /// them was taken for every slot a draw's fresh table made, from the
+    /// title's five recording threads at once.
+    kept: Box<[Mutex<Vec<Option<ID3D12Resource>>>]>,
     /// Where the search for free dynamic slots starts, and which are taken
     /// (by lists not yet reset).
     next: Mutex<(u32, Vec<bool>)>,
@@ -1043,8 +1058,11 @@ impl HostHeap {
             raw,
             twins: (0..if raw == 0 { 0 } else { count + extra }).map(|_| std::sync::atomic::AtomicBool::new(false)).collect(),
             made: Mutex::new(vec![0; count as usize]),
+            made_quick: (0..count).map(|_| std::sync::atomic::AtomicU64::new(0)).collect(),
             copied: Mutex::new(Vec::new()),
-            kept: Mutex::new(vec![None; (count + extra) as usize]),
+            kept: (0..KEPT_STRIPES)
+                .map(|_| Mutex::new(vec![None; ((count + extra) as usize).div_ceil(KEPT_STRIPES)]))
+                .collect(),
             next: Mutex::new((0, vec![false; DYNAMIC as usize])),
             free: std::sync::atomic::AtomicU32::new(DYNAMIC),
             too_long: std::sync::atomic::AtomicU32::new(u32::MAX),
@@ -1412,12 +1430,7 @@ impl HostHeap {
         // as `mirror` takes them.
         let made = self.made.lock().unwrap_or_else(|e| e.into_inner());
         made.get(index as usize).is_some_and(|&made| made != 0 && made == key)
-            && self
-                .kept
-                .lock()
-                .unwrap_or_else(|e| e.into_inner())
-                .get(index as usize)
-                .is_some_and(Option::is_some)
+            && self.kept_slot(index, |slot| slot.is_some_and(|s| s.is_some()))
     }
 
     /// Levels on demand (`crate::tiles`): makes again the host slots of the
@@ -1536,6 +1549,7 @@ impl HostHeap {
         let Some(key) = made.get_mut(index as usize).map(std::mem::take) else {
             return;
         };
+        self.set_quick(index, 0);
         if key == 0 {
             return;
         }
@@ -1800,18 +1814,27 @@ impl HostHeap {
 
     /// Slot `index` now views `resource` (or nothing of the host's).
     fn keep(&self, index: u32, resource: Option<ID3D12Resource>) {
-        let mut kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        if let Some(slot) = kept.get_mut(index as usize) {
+        let old = self.kept_slot(index, |slot| {
+            let slot = slot?;
             // The same again: nothing to retire.
             if slot.as_ref().map(windows::core::Interface::as_raw) == resource.as_ref().map(windows::core::Interface::as_raw) {
-                return;
+                return None;
             }
-            // A running submission may still read the old resource through
-            // this slot.
-            if let Some(old) = std::mem::replace(slot, resource) {
-                crate::host::retire(old);
-            }
+            std::mem::replace(slot, resource)
+        });
+        // A running submission may still read the old resource through
+        // this slot.
+        if let Some(old) = old {
+            crate::host::retire(old);
         }
+    }
+
+    /// (Merged runtime) `f` with slot `index` of `kept`, under its stripe's
+    /// lock (`None`: past the heap).
+    fn kept_slot<R>(&self, index: u32, f: impl FnOnce(Option<&mut Option<ID3D12Resource>>) -> R) -> R {
+        let i = index as usize;
+        let mut stripe = self.kept[i % KEPT_STRIPES].lock().unwrap_or_else(|e| e.into_inner());
+        f(stripe.get_mut(i / KEPT_STRIPES))
     }
 
     /// Makes slot `index` (a dynamic one) a raw buffer view of `len` bytes
@@ -1937,7 +1960,7 @@ impl HostHeap {
         let Some(host) = host() else { return };
         let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
             BufferLocation: gpu,
-            SizeInBytes: size.next_multiple_of(256),
+            SizeInBytes: constant_bytes(size),
         };
         // SAFETY: a slot of our heap; the memory is the caller's.
         unsafe {
@@ -2110,13 +2133,32 @@ impl HostHeap {
         let [tag, i, generation] = unsafe { (handle as *const [u32; 3]).read_unaligned() };
         // Generations start at 1, so a made slot's key is never 0.
         let key = u64::from(generation) << 32 | u64::from(i);
+        // The quick path: the slot is made from this very record already,
+        // and its view is alive; what the locked path does then is only
+        // to return the view.
+        if tag == VIEW_TAG
+            && mirror_quick()
+            && self.made_quick[index as usize].load(std::sync::atomic::Ordering::Acquire) == key
+            && let Some(view) = view_at(i, generation)
+        {
+            #[cfg(feature = "diagnostics")]
+            MIRRORED_QUICK[0].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            return Some(view);
+        }
+        #[cfg(feature = "diagnostics")]
+        MIRRORED_QUICK[1].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        #[cfg(feature = "diagnostics")]
+        let lock_started = std::time::Instant::now();
         let mut made = self.made.lock().unwrap_or_else(|e| e.into_inner());
+        #[cfg(feature = "diagnostics")]
+        crate::copystat::place_took("mirror: waiting for the heap's lock", 0, lock_started.elapsed().as_nanos() as u64);
         let view = (tag == VIEW_TAG).then(|| view_at(i, generation)).flatten();
         let Some(view) = view else {
             // Not a view of ours (never written, or of a resource the
             // title released): nothing to read.
             if made[index as usize] != 0 {
                 made[index as usize] = 0;
+                self.set_quick(index, 0);
                 self.make_null(index);
                 let _ = self.note_buffer(index, None, false);
             } else if for_draw {
@@ -2159,6 +2201,9 @@ impl HostHeap {
                 return Some(view);
             }
             made[index as usize] = if later { 0 } else { key };
+            // Not quick while the slot is being made: a draw that reads it
+            // now waits for the lock, as before.
+            self.set_quick(index, 0);
             let kept = if later {
                 None
             } else {
@@ -2169,8 +2214,22 @@ impl HostHeap {
             }
             self.twin_made(index, kept.is_some() && twinned(&view));
             self.keep(index, kept.flatten());
+            // Made: quick from here on.
+            self.set_quick(index, made[index as usize]);
+        } else {
+            // Made from this record before the quick copy was kept (or by
+            // a path that leaves it 0): quick from here on.
+            self.set_quick(index, key);
         }
         Some(view)
+    }
+
+    /// (Merged runtime) Sets slot `index`'s quick record (`made_quick`),
+    /// under `made`'s lock.
+    fn set_quick(&self, index: u32, key: u64) {
+        if let Some(quick) = self.made_quick.get(index as usize) {
+            quick.store(key, std::sync::atomic::Ordering::Release);
+        }
     }
 
     /// Whether slot `index` is backed by a made host descriptor (tests).
@@ -2188,9 +2247,10 @@ impl HostHeap {
     /// that is brought up to date for it).
     #[cfg(feature = "diagnostics")]
     pub(crate) fn shows(&self, index: u32, buffer: &ID3D12Resource) -> Option<bool> {
-        let kept = self.kept.lock().unwrap_or_else(|e| e.into_inner());
-        let shown = kept.get(index as usize)?.as_ref()?;
-        Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        self.kept_slot(index, |slot| {
+            let shown = slot?.as_ref()?;
+            Some(windows::core::Interface::as_raw(shown) == windows::core::Interface::as_raw(buffer))
+        })
     }
 
     /// What the queue of textures picked by index knows of title slot
@@ -2306,6 +2366,25 @@ pub(crate) fn buffer_range(view: &View) -> Option<(u64, u64)> {
         base + buffer.FirstElement * element,
         u64::from(buffer.NumElements) * element,
     ))
+}
+
+/// The address a shader finds in a descriptor of title memory: where a
+/// buffer view starts, or the ray-tracing structure of a structure's view
+/// (no resource: the view's description holds the address, and the shader
+/// walks the structure from there itself; avatarmanz ba509c5a).
+///
+/// (Merged runtime) A structure's only with the structure builder allowed
+/// (`VICTORY_BVH_BUILDER=1`): without it nothing builds or unpacks the
+/// structures, a walk through what lies there is no picture of the scene and
+/// may run long, so the address reads 0 and every ray misses at once, as
+/// before.
+pub(crate) fn view_address(view: &View) -> Option<u64> {
+    const STRUCTURE: u32 = D3D12_SRV_DIMENSION_RAYTRACING_ACCELERATION_STRUCTURE.0 as u32;
+    match view {
+        View::Shader(_, Some(desc)) if desc[1] == STRUCTURE => crate::pipeline::builder_allowed()
+            .then(|| u64::from(desc[4]) | u64::from(desc[5]) << 32),
+        _ => buffer_range(view).map(|range| range.0),
+    }
 }
 
 /// The title memory the host slot of buffer view `view` is made on
@@ -2936,6 +3015,15 @@ fn twin_uav(
 
 /// Makes the host descriptor for `view` at `at`: the host resource it
 /// views, or `None` if it cannot.
+/// (AvatarManz 1d2f4763) The bytes of the host's constant buffer view for a
+/// title's of `size`: whole 256s, and at most the 64 KiB a shader can index.
+/// A larger view is an invalid call (the host may remove the device), and
+/// the title's heap holds such sizes in slots it does not use.
+fn constant_bytes(size: u32) -> u32 {
+    const LARGEST: u32 = 64 << 10;
+    size.min(LARGEST).next_multiple_of(256)
+}
+
 fn make(view: &View, at: D3D12_CPU_DESCRIPTOR_HANDLE) -> Option<Kept> {
     make_twinned(view, at, None)
 }
@@ -2963,7 +3051,7 @@ fn make_twinned(
             }
             let desc = D3D12_CONSTANT_BUFFER_VIEW_DESC {
                 BufferLocation: gpu,
-                SizeInBytes: size.next_multiple_of(256),
+                SizeInBytes: constant_bytes(size),
             };
             // SAFETY: slots of our heap; the range lies in the host copy.
             unsafe {
@@ -3188,6 +3276,21 @@ pub(crate) fn placed_texture(view: &View) -> Option<View> {
     let texture = crate::resource::texture_at(address, resource)?;
     Some(View::Shader(texture as usize, desc[..10].try_into().ok()))
 }
+
+/// (Merged runtime) The stripes of [`HostHeap`]'s `kept`.
+const KEPT_STRIPES: usize = 64;
+
+/// (Merged runtime) Whether [`HostHeap::mirror`] answers a slot made from
+/// the same record without its lock (`VICTORY_MIRROR_QUICK=0`: no).
+fn mirror_quick() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_MIRROR_QUICK").is_none_or(|v| v != "0"))
+}
+
+/// (Merged runtime, diagnostics) Mirrors answered on the quick path, and
+/// those that took the lock, since the last line.
+#[cfg(feature = "diagnostics")]
+pub(crate) static MIRRORED_QUICK: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
 
 /// A null view of the kind `view` is, for a slot whose view the host
 /// cannot make: unordered access (to a buffer or a 2D texture) or a shader
