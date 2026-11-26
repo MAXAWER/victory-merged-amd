@@ -32,6 +32,13 @@ $s = [ordered]@{
     VICTORY_RENDER_SCALE       = '0.5'
     VICTORY_FRAME_INTERVAL_MS  = '16.667'
     VICTORY_PIPELINE_BOOK      = '1'
+    # A present waits for the work of its own frame. With presents sent ahead, light and shadow on
+    # characters alternated every frame and black patches came and went (recordings of 2026-11-27:
+    # 160-200 tile flashes a run against 36); costs about 2 ms a frame.
+    VICTORY_LATE_WAIT          = '2'
+    # Without the ray-tracing structure builder the title's rays find nothing, every frame alike;
+    # part of the shader translation.
+    VICTORY_RAYS_MISS          = '1'
 }
 if ($Fps30) { $s.Remove('VICTORY_FRAME_INTERVAL_MS') }
 

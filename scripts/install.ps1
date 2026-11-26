@@ -92,7 +92,7 @@ if ($LASTEXITCODE -ne 0) { Write-Host "The shader translation reported an error 
 Write-Host ""
 Write-Host "== Ready =="
 Write-Host "Start the title with Play.cmd."
-Write-Host "Keys: WASD move, IJKL camera, Enter/Space = A, Backspace = B, X = X, Y = Y, Q/E = bumpers, Z/C = triggers, Esc = menu."
+Write-Host "Keys: WASD move, IJKL camera, Enter/Space = A, Backspace = B, X = X, Y = Y, Q/E = bumpers, Z/C = triggers, Esc = menu. The mouse looks around after a click on the picture or F9 (F9 again lets it go)."
 Write-Host "An XInput gamepad also works."
 Write-Host "The first minutes of every new scene stutter while the driver compiles pipelines."
 Write-Host "After a first play session, run scripts\warm.ps1 to make them ahead."

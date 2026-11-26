@@ -25,6 +25,7 @@ missing, `Install.cmd` offers to install them with `winget`.
 
 Keys: WASD move, IJKL camera, Enter/Space = A, Backspace = B, X = X, Y = Y,
 Q/E = bumpers, Z/C = triggers, Esc = menu. An XInput gamepad also works.
+The mouse looks around after a click on the picture (or F9).
 
 Options of `scripts\play.ps1` (pass them to `Play.cmd` too):
 
@@ -33,7 +34,7 @@ Options of `scripts\play.ps1` (pass them to `Play.cmd` too):
 | `-Game <folder>` | Folder of your copy. Default: the one saved by `Install.cmd`. |
 | `-Console series-x\|series-s` | Console profile. Default `series-x`. |
 | `-Panel` | On-screen frame-rate panel. |
-| `-RayTracing` | Builds the ray-tracing structures for the title's indirect light. Experimental. |
+| `-RayTracing` | The title's ray-traced light. Works on an RX 9070 XT, about 14-15 fps in heavy scenes. |
 | `-Fps30` | Leaves the frame interval setting out. |
 | `-Cache <folder>` | Cache folder. Default `%LOCALAPPDATA%\victory\cache-merged-amd`. |
 | `-More @{NAME='value'}` | Extra `VICTORY_*` settings. |
@@ -50,7 +51,7 @@ sessions drew with ahead of time (resumable).
 
 Нужны Windows 10/11 x64, видеокарта с Direct3D 12 и 12-16 ГБ видеопамяти, лучше 32 ГБ ОЗУ и файл подкачки 32-48 ГБ, около 3 ГБ на диске для сборки и ваша собственная копия игры.
 
-## Where it stands (2026-11-26)
+## Where it stands (2026-11-27)
 
 Measured on: RX 9070 XT, Ryzen 7 9850X3D, 32 GB DDR5-6000, Windows 11, Series X
 profile, the title's 4K mode with the world drawn at 1920x1080. One 7-minute run
@@ -58,22 +59,24 @@ from one save: the opening cutscenes into the first playable scene.
 
 | What | Result |
 | --- | --- |
-| Whole run | median 44 ms a frame (22.5 fps); 90 % of frames under 113 ms |
+| Whole run | median 47 ms a frame (21 fps); 90 % of frames under 78 ms |
 | Menus and loading screens | up to 60 fps |
-| Cutscene close-ups (1,400-1,600 draws) | 21-34 fps |
-| First playable scene (about 3,900 draws) | 25 fps, steady at 39-40 ms |
-| Heaviest shots (4,200-5,700 draws) | 17-22 fps |
-| Memory | about 30 GB private (23 GB working set), 12 GB of video memory |
+| Cutscene close-ups (1,400-1,600 draws) | 18-26 fps |
+| First playable scene (about 3,900 draws) | 23 fps, steady |
+| Heaviest shots (4,200-5,800 draws) | 16-22 fps |
+| Memory | about 29 GB private (24 GB working set), 12 GB of video memory |
+| Picture | no flicker in the measured scenes (36-39 tile flashes over a 7-minute recording, all in an explosion shot, against 160-200 before) |
 | Previous base of this repo, same save and PC | median 76 ms (13 fps) |
+
+Every run is recorded at 60 frames a second and looked through by a script for frames held, pictures going back and tiles flashing.
 
 ## Known problems
 
 - Not yet a stable 30 fps in heavy scenes: the frame is CPU-bound, the card is 65-70 % busy.
-- Hitches when a new scene loads.
+- Hitches of 0.2-0.9 s when a scene loads on a PC with 32 GB of RAM: the process holds 22-24 GB of it and Windows pages (the work on memory is described in PORTING.md).
 - Two pipelines are left out because the AMD shader compiler crashes on them.
 - 29 pipelines that the title creates through two unimplemented device methods are not drawn.
-- Dark or black patches where there is no direct light: the title's ray-traced indirect light is off by default (`-RayTracing` is experimental).
-- The painted loading screen jerks.
+- With ray tracing on, 14-15 fps in heavy scenes.
 
 ## What is merged
 
@@ -82,7 +85,8 @@ from one save: the opening cutscenes into the first playable scene.
   - [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD): the guard against the AMD shader compiler crashing.
   - [vitutu1/victory-perf](https://github.com/vitutu1/victory-perf): the loader hook that takes out the title's watchdog.
   - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) PR #927 by tippythetaidum: 16-bit buffer channels through unsigned twin views (faces).
-  - Own work: scripted keys for automated runs, warm refusals, the RX 9070 XT findings (clean-up pass 4, Series X with the 4K mode for a right-sized interface), per-part timing of list reset/close.
+  - [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) branch `rx9070xt`: RX 9070 XT and 16 GB fixes, texture uploads in the submission prelude, PC FidelityFX 4.1.2 to 4K.
+  - Own work: the fix for flickering light and black patches (a present waits for its own frame), mouse look, a rays-miss mode for runs without ray tracing, objects of a command list released on a thread of their own, scripted keys for automated runs, warm refusals, the RX 9070 XT findings (clean-up pass 4, Series X with the 4K mode for a right-sized interface), per-part timing of list reset/close.
 
 The history of the previous KLBF-based tree and all measurements are in
 [PORTING.md](PORTING.md) (Russian).

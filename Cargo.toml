@@ -71,12 +71,16 @@ opt-level = 2
 
 [profile.release]
 debug = "line-tables-only"
+lto = "thin"
+codegen-units = 1
 
 # The development build: release code generation plus the `diagnostics`
 # feature (`cargo build --profile diag -p victory --features diagnostics`),
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+lto = false
+codegen-units = 16
 
 # (Local) The build to play with: whole-program optimisation, one codegen unit.
 # Built with RUSTFLAGS=-C target-cpu=native into its own folder.

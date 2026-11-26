@@ -201,6 +201,29 @@ pub fn builder_bounds() -> bool {
     *ON.get_or_init(|| std::env::var_os("VICTORY_BVH_BOUNDS").is_none_or(|v| v != "0"))
 }
 
+/// (Local) Whether the ray/node test answers "nothing hit" whatever the node
+/// (`VICTORY_RAYS_MISS=1`; off by default): for runs without the ray-tracing
+/// structure builder (`VICTORY_BVH_BUILDER` unset).
+///
+/// Without the builder the static world's structures stay packed as they
+/// were shipped and the dynamic ones are never built, but the title's trace
+/// programs walk them all the same. What they find there is not nothing: in
+/// a recording of the opening (2026-11-27, RX 9070 XT) the light and shadow
+/// on a character alternated with every frame, dark with hard shadow shapes,
+/// then lit, and black patches came and went; with the builder on the same
+/// shot stood still. The title seems to give its traces another structure
+/// buffer every other frame. With the switch every box test returns no child
+/// and every triangle test a miss, so a traversal ends at its root: rays
+/// find nothing, every frame alike, and the node's memory is not read at
+/// all. Lamps then cast no traced shadow and the probes see the sky
+/// (`victory-gpu`'s ambient stand-in is made for exactly that).
+///
+/// Part of the translation: the shader cache keys on it.
+pub fn rays_miss() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_RAYS_MISS").is_some_and(|v| v == "1"))
+}
+
 /// The clean-up passes that run over a translated program before it is
 /// written (`bitcode::opt`): a set of that module's pass bits. Every pass
 /// is exact, so the switch is for telling a translator fault from a

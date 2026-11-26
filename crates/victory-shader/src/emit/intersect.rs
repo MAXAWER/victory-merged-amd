@@ -134,6 +134,23 @@ impl<'a> Lower<'a> {
             direction: [f[4], f[5], f[6]],
             inverse: [f[7], f[8], f[9]],
         };
+        if crate::emit::rays_miss() {
+            // (Local, `VICTORY_RAYS_MISS=1`) Nothing is hit: a box node has
+            // no child the ray enters, a triangle is missed. The node is
+            // not read.
+            let c = self.cur;
+            let (k4, k6) = (self.s.m.i32(4), self.s.m.i32(6));
+            let pair = self.s.m.bin(c, Bin::And, pointer, k6);
+            let is_box = self.s.m.cmp(c, pred::EQ, pair, k4);
+            let none = self.s.m.i32(bvh::NONE);
+            for (k, miss) in bvh::MISS.iter().enumerate() {
+                let miss = self.s.m.i32(miss.to_bits());
+                let r = self.s.m.select(c, is_box, none, miss);
+                self.write(inst, Reg::V(dst + k as u8), r, guard);
+            }
+            let _ = ray;
+            return Ok(());
+        }
         let c = self.cur;
         let at = match nodes {
             BvhNodes::Resource => {
