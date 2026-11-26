@@ -1366,7 +1366,7 @@ type Places = HashMap<(&'static str, u32), (u64, u64)>;
 static PLACES: Mutex<Option<Places>> = Mutex::new(None);
 
 thread_local! {
-    static MY_PLACES: std::cell::RefCell<(Places, u32)> = std::cell::RefCell::new((HashMap::new(), 0));
+    static MY_PLACES: std::cell::RefCell<(Places, u32, u64)> = std::cell::RefCell::new((HashMap::new(), 0, 0));
 }
 
 /// Adds `ns` to place `(name, line)`.
@@ -1377,7 +1377,11 @@ pub(crate) fn place_took(name: &'static str, line: u32, ns: u64) {
         e.0 += 1;
         e.1 += ns;
         m.1 += 1;
-        if m.1 >= 4096 {
+        // Every 4,096 adds, or every half second for a thread that adds few
+        // (the submitting thread's parts).
+        let now = now_us();
+        if m.1 >= 4096 || now.saturating_sub(m.2) >= 500_000 {
+            m.2 = now;
             m.1 = 0;
             let mine = std::mem::take(&mut m.0);
             let mut all = PLACES.lock().unwrap_or_else(|e| e.into_inner());

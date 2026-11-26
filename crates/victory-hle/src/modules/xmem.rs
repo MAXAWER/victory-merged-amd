@@ -47,6 +47,19 @@ pub(crate) fn on_wine() -> bool {
     *WINE
 }
 
+/// (Merged runtime) Whether the title's page pool is made committed
+/// (`VICTORY_PAGE_POOL_COMMIT=1`; off by default; always under Wine): only a
+/// section made with `SEC_COMMIT` can be opened as one D3D12 heap, so that
+/// the card reads the title's pages where they are, with no host copy
+/// (`victory_gpu`'s in-place memory, `VICTORY_INPLACE`). It costs the pool's
+/// whole size of commit charge at once (6.1 GiB for this title: the pagefile
+/// backs it); nothing of it is resident until it is touched.
+pub(crate) fn pool_committed() -> bool {
+    static ON: LazyLock<bool> =
+        LazyLock::new(|| on_wine() || std::env::var_os("VICTORY_PAGE_POOL_COMMIT").is_some_and(|v| v == "1"));
+    *ON
+}
+
 /// Standard memory the title has handed to the system.
 static TRANSFERRED: AtomicUsize = AtomicUsize::new(0);
 
@@ -188,6 +201,13 @@ pub extern "system" fn XMemVirtualAlloc(
                 "the title commits memory (XMemVirtualAlloc)"
             );
         }
+    }
+    // (Merged runtime, avatarmanz 9c23e8dd4) The title asks for its 32-bit
+    // graphics heap with kind 0x42000, without the 64 KiB page bits: not
+    // `placeholder` above, though the host makes a placeholder of it all
+    // the same. Remembered for renderer port 1 ([`arrange`]).
+    if !at.is_null() && constrained && kind & MEM_COMMIT == 0 && flags & ADDRESS_32BIT != 0 {
+        LOW_RESERVATIONS.lock().unwrap_or_else(|e| e.into_inner()).push((at as usize, size));
     }
     at
 }
@@ -369,7 +389,8 @@ pub extern "system" fn XMemIsToolsMemAvailable() -> BOOL {
 
 const PAGE: usize = 64 << 10;
 
-struct Section(HANDLE);
+/// A section and how many 64 KiB pages it has.
+struct Section(HANDLE, usize);
 
 // SAFETY: a section handle may be used from any thread.
 unsafe impl Send for Section {}
@@ -410,6 +431,10 @@ struct Physical {
     /// card reads them and has them filled afterwards by DirectStorage,
     /// which writes through views of our own.
     shown: HashMap<(usize, usize), Vec<usize>>,
+    /// (Merged runtime) Slices ever shown in a view of the title's or taken
+    /// for a view of ours ([`Slice::key`]), kept only with renderer port 1
+    /// ([`port_on`]): a slice not here still reads as zeros ([`arrange`]).
+    touched: std::collections::HashSet<(usize, usize)>,
 }
 
 static PHYSICAL: LazyLock<Mutex<Physical>> = LazyLock::new(|| {
@@ -450,7 +475,7 @@ pub extern "system" fn XMemAllocatePhysicalPages(
             // touched, and committing a reserved one page by page costs a
             // wineserver request each that scans every range committed so
             // far: commit it whole there.
-            PAGE_READWRITE | if on_wine() { SEC_COMMIT } else { SEC_RESERVE },
+            PAGE_READWRITE | if pool_committed() { SEC_COMMIT } else { SEC_RESERVE },
             (size as u64 >> 32) as u32,
             size as u32,
             std::ptr::null(),
@@ -470,8 +495,8 @@ pub extern "system" fn XMemAllocatePhysicalPages(
     );
     // For the GPU side's in-place census: only a committed section can be
     // opened as a host heap.
-    victory_gpu::title_memory_section(handle as usize, size as u64, on_wine());
-    let section = Arc::new(Section(handle));
+    victory_gpu::title_memory_section(handle as usize, size as u64, pool_committed());
+    let section = Arc::new(Section(handle, n));
     let mut physical = physical();
     let first = physical.next_page;
     physical.next_page += n * FRAMES;
@@ -559,10 +584,13 @@ impl Drop for View {
 fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)>> {
     let end = offset.checked_add(len)?;
     let pages = pages.get(offset / PAGE..end.div_ceil(PAGE))?;
-    let physical = physical();
+    let mut physical = physical();
     let mut runs: Vec<(Slice, usize)> = Vec::new();
     for page in pages {
-        let slice = physical.pages.get(page)?;
+        let slice = physical.pages.get(page)?.clone();
+        if port_on() {
+            physical.touched.insert(slice.key(0));
+        }
         match runs.last_mut() {
             Some((first, n))
                 if Arc::ptr_eq(&first.section, &slice.section)
@@ -570,7 +598,7 @@ fn runs(pages: &[usize], offset: usize, len: usize) -> Option<Vec<(Slice, usize)
             {
                 *n += 1;
             }
-            _ => runs.push((slice.clone(), 1)),
+            _ => runs.push((slice, 1)),
         }
     }
     Some(runs)
@@ -737,6 +765,108 @@ fn merged(mut pieces: Vec<(usize, usize)>) -> Vec<(usize, usize)> {
     runs
 }
 
+/// (Merged runtime, avatarmanz 4b82f6c25) Renderer port 1
+/// (`VICTORY_PORT_CONSTANTS=1`; the GPU side's half is `victory_gpu`'s
+/// `port`): read here for xmem's part, [`arrange`].
+fn port_on() -> bool {
+    static ON: LazyLock<bool> = LazyLock::new(|| std::env::var("VICTORY_PORT_CONSTANTS").is_ok_and(|v| v.trim() == "1"));
+    *ON
+}
+
+/// The title's reservations of 64 KiB pages for 32-bit graphics memory:
+/// base and bytes (one, of 185 MB, in the title this is for).
+static LOW_RESERVATIONS: Mutex<Vec<(usize, usize)>> = Mutex::new(Vec::new());
+
+/// Pages given another place in their section so far by [`arrange`], and
+/// the times it found a page that was not fresh.
+static ARRANGED: [std::sync::atomic::AtomicU64; 2] = [const { std::sync::atomic::AtomicU64::new(0) }; 2];
+
+/// Before `pages` are mapped at `base`: if `base` lies in a 32-bit graphics
+/// reservation ([`LOW_RESERVATIONS`]) whose pages are all one section at
+/// least as big, the page numbers are given the slices of that section in
+/// the reservation's address order (each page at its offset in the
+/// reservation), so that the reservation becomes one stretch of the section
+/// and the GPU side can open it as one heap.
+///
+/// The title takes all the pages of its 185 MB heap in one call and maps
+/// its five pieces in another order than their addresses. Only fresh
+/// slices are exchanged: never shown in a view nor taken for one of ours
+/// (`Physical::touched`; avatarmanz reads a commit bit their sections
+/// keep), so every page still reads as zeros and which slice a number names
+/// is not observable by the title.
+fn arrange(physical: &mut Physical, base: usize, pages: &[usize]) {
+    use std::sync::atomic::Ordering::Relaxed;
+    let Some((first, bytes)) = LOW_RESERVATIONS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .iter()
+        .copied()
+        .find(|&(at, len)| at <= base && base + pages.len() * PAGE <= at + len)
+    else {
+        return;
+    };
+    let Some(section) = pages.first().and_then(|p| physical.pages.get(p)).map(|s| s.section.clone()) else {
+        return;
+    };
+    if section.1 * PAGE < bytes || !pages.iter().all(|p| physical.pages.get(p).is_some_and(|s| Arc::ptr_eq(&s.section, &section))) {
+        static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+        if SAID.fetch_add(1, Relaxed) < 4 {
+            tracing::warn!(
+                at = format_args!("{base:#x}"),
+                pages = pages.len(),
+                section_pages = section.1,
+                reservation = bytes / PAGE,
+                "renderer port 1: pages mapped into the 32-bit heap are not of one section as big as it: left where they are"
+            );
+        }
+        return;
+    }
+    let key = |index: usize| (Arc::as_ptr(&section) as usize, index);
+    // Which number has which slice of the section.
+    let mut owner: HashMap<usize, usize> = physical
+        .pages
+        .iter()
+        .filter(|(_, s)| Arc::ptr_eq(&s.section, &section))
+        .map(|(&number, s)| (s.index, number))
+        .collect();
+    let mut moved = 0u64;
+    for (i, number) in pages.iter().enumerate() {
+        let want = (base - first) / PAGE + i;
+        let Some(have) = physical.pages.get(number).map(|s| s.index) else {
+            continue;
+        };
+        if have == want {
+            continue;
+        }
+        if physical.touched.contains(&key(have)) || physical.touched.contains(&key(want)) {
+            ARRANGED[1].fetch_add(1, Relaxed);
+            continue;
+        }
+        if let Some(other) = owner.get(&want).copied()
+            && let Some(slice) = physical.pages.get_mut(&other)
+        {
+            slice.index = have;
+            owner.insert(have, other);
+        }
+        if let Some(slice) = physical.pages.get_mut(number) {
+            slice.index = want;
+        }
+        owner.insert(want, *number);
+        moved += 1;
+    }
+    if moved > 0 {
+        let all = ARRANGED[0].fetch_add(moved, Relaxed) + moved;
+        tracing::info!(
+            at = format_args!("{base:#x}"),
+            pages = pages.len(),
+            moved,
+            all,
+            not_fresh = ARRANGED[1].load(Relaxed),
+            "renderer port 1: the title's 32-bit graphics pages given their section's slices in address order"
+        );
+    }
+}
+
 /// Maps `n` pages at `address`, in place of what is mapped there; null
 /// `pages` unmaps. Returns `address`, or null if a page or the host fails.
 pub extern "system" fn XMemMapPhysicalPages(
@@ -759,6 +889,9 @@ pub extern "system" fn XMemMapPhysicalPages(
     }
     // SAFETY: the title passes `n` page numbers.
     let pages = unsafe { std::slice::from_raw_parts(pages, n) };
+    if port_on() {
+        arrange(&mut physical, base, pages);
+    }
     let mut i = 0;
     while i < n {
         let Some(first) = physical.pages.get(&pages[i]).cloned() else {
@@ -890,8 +1023,12 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
     victory_gpu::title_memory_remapped(base, len);
     // What the range shows now, for the GPU side's in-place census.
     victory_gpu::title_memory_view(base, len, slice.section.0 as usize, (slice.index * PAGE) as u64);
+    let port = port_on();
     for k in 0..len.div_ceil(PAGE) {
         physical.shown.entry(slice.key(k)).or_default().push(base + k * PAGE);
+        if port {
+            physical.touched.insert(slice.key(k));
+        }
     }
     physical.views.insert(base, (len, slice));
     true
@@ -899,8 +1036,8 @@ fn map(physical: &mut Physical, base: usize, len: usize, slice: Slice) -> bool {
 
 /// Commits the section pages a view shows (once per page, whichever view).
 fn commit(base: usize, len: usize) -> bool {
-    if on_wine() {
-        return true; // sections are committed whole there
+    if pool_committed() {
+        return true; // the section is committed whole
     }
     // SAFETY: `[base, base + len)` is a view of a reserved section.
     if !unsafe { VirtualAlloc(base as *const c_void, len, MEM_COMMIT, PAGE_READWRITE) }.is_null() {

@@ -135,13 +135,53 @@ pub(crate) fn place_part(device: &ID3D12Device, start: u64, len: u64) -> Result<
 /// buffers or a title buffer, if [`level`] asks for it and the memory can
 /// be opened; `None` leaves the caller to make a copy, as before.
 pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
-    if level() < if window { 1 } else { 2 } {
+    place_for_as(start, len, window, true)
+}
+
+/// [`place_for`] for a title buffer whose shaders may write it or not
+/// (`writable`: its resource allows unordered access). (Merged runtime) A
+/// buffer shaders cannot write may be view memory too: one run of a
+/// section made committed (`VICTORY_PAGE_POOL_COMMIT=1`) is placed in a heap
+/// opened on that section ([`place_view`]); the card reads the title's
+/// pages where they are. Only such buffers, at level 1 already: nothing a
+/// flight writes is in place, so the flights' rules stand as they are.
+pub(crate) fn place_buffer(start: u64, len: u64, writable: bool) -> Option<Placed> {
+    place_for_as(start, len, false, writable)
+}
+
+fn place_for_as(start: u64, len: u64, window: bool, writable: bool) -> Option<Placed> {
+    let views_ok = !window && !writable && level() >= 1;
+    if level() < if window { 1 } else { 2 } && !views_ok {
         return None;
     }
     // View memory: known from the runtime without asking Windows.
-    if cover(start as usize, len as usize) != Cover::None {
-        STATS[4].fetch_add(1, Ordering::Relaxed);
-        return None;
+    match cover(start as usize, len as usize) {
+        // Private memory: windows at level 1, title buffers at level 2, and
+        // (merged runtime) title buffers shaders cannot write at level 1.
+        Cover::None if level() >= if window { 1 } else { 2 } || views_ok => {}
+        Cover::Run(section, offset) if views_ok => {
+            if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
+                STATS[6].fetch_add(1, Ordering::Relaxed);
+                return None;
+            }
+            let host = crate::host::host()?;
+            return match place_view(&host.device, section, offset, len) {
+                Some(placed) => {
+                    STATS[2].fetch_add(1, Ordering::Relaxed);
+                    STATS[3].fetch_add(len, Ordering::Relaxed);
+                    VIEWS_PLACED.fetch_add(1, Ordering::Relaxed);
+                    Some(placed)
+                }
+                None => {
+                    STATS[4].fetch_add(1, Ordering::Relaxed);
+                    None
+                }
+            };
+        }
+        _ => {
+            STATS[4].fetch_add(1, Ordering::Relaxed);
+            return None;
+        }
     }
     if STATS[1].load(Ordering::Relaxed) + STATS[3].load(Ordering::Relaxed) + len > most() {
         STATS[6].fetch_add(1, Ordering::Relaxed);
@@ -168,6 +208,66 @@ pub(crate) fn place_for(start: u64, len: u64, window: bool) -> Option<Placed> {
     }
 }
 
+/// Something placed elsewhere (`crate::port`) in the same form: counted as
+/// [`place_for`] counts, so that [`gone`] takes it off again. (Merged
+/// runtime: avatarmanz 86dc10972.)
+pub(crate) fn counted(window: bool, bytes: u64) {
+    let at = if window { 0 } else { 2 };
+    STATS[at].fetch_add(1, Ordering::Relaxed);
+    STATS[at + 1].fetch_add(bytes, Ordering::Relaxed);
+}
+
+/// (Merged runtime) Title buffers placed in a heap opened on a committed
+/// section ([`place_view`]), since the start.
+static VIEWS_PLACED: AtomicU64 = AtomicU64::new(0);
+
+/// (Merged runtime) Heaps opened on the title's committed sections of
+/// physical pages, by section handle (`None`: the host refused it).
+#[allow(clippy::type_complexity)]
+static SECTION_HEAPS: Mutex<Option<std::collections::HashMap<usize, Option<ID3D12Heap>>>> = Mutex::new(None);
+
+/// (Merged runtime) A buffer over `len` bytes of title memory that one run
+/// of the committed section `section` shows from byte `offset` on: placed
+/// in the heap opened on that section (once, on its first use).
+fn place_view(device: &ID3D12Device, section: usize, offset: u64, len: u64) -> Option<Placed> {
+    if !views().sections.iter().any(|s| s.0 == section && s.2) {
+        return None;
+    }
+    let heap = {
+        let mut map = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner());
+        let map = map.get_or_insert_with(std::collections::HashMap::new);
+        match map.get(&section) {
+            Some(heap) => heap.clone()?,
+            None => {
+                let opened = open(device, From::Section(section));
+                match &opened {
+                    Ok(_) => tracing::info!(section, "a committed section of title pages opened as a heap: buffers in it are read in place"),
+                    Err(e) => tracing::warn!(section, error = %e, "a committed section of title pages not opened as a heap: copies instead"),
+                }
+                let heap = opened.ok();
+                map.insert(section, heap.clone());
+                heap?
+            }
+        }
+    };
+    let aligned = offset & !(K64 as u64 - 1);
+    let bias = offset - aligned;
+    let bytes = (bias + len.max(1)).next_multiple_of(K64 as u64);
+    let buffer = match place(device, &heap, aligned, bytes) {
+        Ok(buffer) => buffer,
+        Err(e) => {
+            static SAID: AtomicU64 = AtomicU64::new(0);
+            if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                tracing::warn!(section, offset, len, error = %e, "a buffer not placed on a section of title pages: a copy instead");
+            }
+            return None;
+        }
+    };
+    // SAFETY: a live buffer.
+    let gpu = unsafe { buffer.GetGPUVirtualAddress() } + bias;
+    Some(Placed { buffer, heap, gpu, bias })
+}
+
 /// What [`place_for`] gave is gone.
 pub(crate) fn gone(window: bool, bytes: u64) {
     let at = if window { 0 } else { 2 };
@@ -182,6 +282,8 @@ pub(crate) fn gone(window: bool, bytes: u64) {
 /// the runtime to call before the title's own `VirtualFree` once it takes
 /// that call over.
 pub fn title_memory_freeing(at: usize, len: usize) {
+    // Renderer port 1's regions there: no longer what the title shows.
+    crate::port::forget(at, len);
     if STATS[0].load(Ordering::Relaxed) + STATS[2].load(Ordering::Relaxed) == 0 {
         return;
     }
@@ -290,6 +392,11 @@ pub fn title_memory_section(section: usize, bytes: u64, committed: bool) {
         let mut v = views();
         v.sections.retain(|s| s.0 != section);
         v.sections.push((section, bytes, committed));
+    }
+    // (Merged runtime) A heap opened on an earlier section with this
+    // handle's number is that section's.
+    if let Some(map) = SECTION_HEAPS.lock().unwrap_or_else(|e| e.into_inner()).as_mut() {
+        map.remove(&section);
     }
     // A view of our own made on an earlier section that had this handle's
     // number shows that section's pages, not this one's: it is forgotten
@@ -585,6 +692,41 @@ fn cover_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize)
 /// [`Cover`] of `[at, at + len)` by the title's views as they are now.
 pub(crate) fn cover(at: usize, len: usize) -> Cover {
     cover_in(&views().views, at, len)
+}
+
+/// The whole stretch of views around `[at, at + len)` that follow one
+/// another in memory and in one section alike, if the range is one run of a
+/// section ([`Cover::Run`]): its first address, its bytes, the section and
+/// the offset of its first byte in it. (Merged runtime: avatarmanz
+/// 86dc10972, for `crate::port`.)
+pub(crate) fn stretch(at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let v = views();
+    stretch_in(&v.views, at, len)
+}
+
+fn stretch_in(views: &BTreeMap<usize, (usize, usize, u64)>, at: usize, len: usize) -> Option<(usize, usize, usize, u64)> {
+    let Cover::Run(section, offset) = cover_in(views, at, len) else {
+        return None;
+    };
+    // Every view of the stretch has the same address less section offset.
+    let delta = at as i128 - offset as i128;
+    let follows = |a: usize, s: usize, o: u64| s == section && a as i128 - o as i128 == delta;
+    let (&first, &(n, _, _)) = views.range(..=at).next_back()?;
+    let mut start = first;
+    for (&a, &(n, s, o)) in views.range(..first).rev() {
+        if a + n != start || !follows(a, s, o) {
+            break;
+        }
+        start = a;
+    }
+    let mut stop = first + n;
+    for (&a, &(n, s, o)) in views.range(first + 1..) {
+        if a != stop || !follows(a, s, o) {
+            break;
+        }
+        stop = a + n;
+    }
+    Some((start, stop - start, section, (start as i128 - delta) as u64))
 }
 
 /// Whether `[at, at + len)` is private memory, all committed and

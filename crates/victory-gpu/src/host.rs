@@ -980,6 +980,8 @@ pub(crate) struct HostList {
     /// With `crate::cardmeter::pipelines`: the pair of the pipeline bound
     /// last, open until the next one is bound or the list closes.
     pipeline_meter: AtomicU32,
+    /// (Merged runtime) [`HostList::shader_writes_waited`].
+    writes_waited: std::sync::atomic::AtomicBool,
     /// The records its draws read from slots that its prelude fills
     /// (`crate::indirect::gather`).
     gather: Mutex<Gather>,
@@ -4215,6 +4217,7 @@ fn late_line(frames: f64) {
         }
     }
     card_steps::log(frames);
+    crate::port::log(frames);
     {
         let found = [0, 1].map(|i| crate::shadow::LOOKUPS[i].swap(0, Ordering::Relaxed) as f64 / frames);
         tracing::info!(
@@ -4640,6 +4643,7 @@ impl Host {
                 _alive: Counted::new(),
                 meter: AtomicU32::new(u32::MAX),
                 pipeline_meter: AtomicU32::new(u32::MAX),
+                writes_waited: std::sync::atomic::AtomicBool::new(false),
                 gather: Mutex::default(),
                 #[cfg(feature = "diagnostics")]
                 notes: Mutex::default(),
@@ -6331,6 +6335,8 @@ impl Host {
         let mut settled = std::time::Duration::ZERO;
         // One write-watch asking for everything the submission refreshes
         // (`VICTORY_ASK_ONCE`): per copy, the span of its refreshed ranges.
+        #[cfg(feature = "diagnostics")]
+        let ask_part = crate::copystat::scope("submit: the one asking, and stale under flights");
         if crate::watch::once() {
             let mut spans = Batch::default();
             for list in runs {
@@ -6363,6 +6369,10 @@ impl Host {
             self.settle(&mut submitted, WHY_STALE);
             settled += settling.elapsed();
         }
+        #[cfg(feature = "diagnostics")]
+        drop(ask_part);
+        #[cfg(feature = "diagnostics")]
+        let steps_part = crate::copystat::scope("submit: the lists' steps (refreshes, copies, fills)");
         for list in runs {
             list.run_deferred(&mut batch, |i| own.as_ref().is_some_and(|own| own.takes(list, i)));
             firsts.push(lists.len());
@@ -6373,12 +6383,16 @@ impl Host {
         }
         batch.flush();
         crate::watch::ask_once_end();
+        #[cfg(feature = "diagnostics")]
+        drop(steps_part);
         // The snapshots of the ranges shaders may write, if they were left
         // for now (`crate::shadow::wide_back`): the refreshes are done, the
         // lists have not gone to the card.
         {
             #[cfg(feature = "diagnostics")]
             let snapshots = std::time::Instant::now();
+            #[cfg(feature = "diagnostics")]
+            let _part = crate::copystat::scope("submit: snapshots of shader-written ranges");
             crate::shadow::take_snapshots();
             #[cfg(feature = "diagnostics")]
             crate::copystat::add(crate::copystat::C::SnapshotUs, snapshots.elapsed().as_micros() as u64);
@@ -6392,26 +6406,43 @@ impl Host {
             self.settle(&mut submitted, WHY_MOST);
             settled += settling.elapsed();
         }
-        let card = self.card_before(runs, flown, *submitted);
+        let card = {
+            #[cfg(feature = "diagnostics")]
+            let _part = crate::copystat::scope("submit: card copies' sends and compares");
+            self.card_before(runs, flown, *submitted)
+        };
         if let Some(check) = card.as_ref().and_then(|c| c.check.clone()) {
             lists.push(Some(check));
         }
         // The slots the lists index are made before they go to the card.
-        crate::descriptor::sync_heaps_end(heap_sync);
+        {
+            #[cfg(feature = "diagnostics")]
+            let _part = crate::copystat::scope("submit: waiting for the heap sync beside");
+            crate::descriptor::sync_heaps_end(heap_sync);
+        }
         let prepared = std::time::Instant::now();
         if late {
             *submitted += 1;
             // SAFETY: closed lists; the fence is ours.
-            let signalled = unsafe {
-                self.queue.ExecuteCommandLists(&lists);
-                self.queue.Signal(&self.fence, *submitted)
+            let signalled = {
+                #[cfg(feature = "diagnostics")]
+                let _part = crate::copystat::scope("submit: ExecuteCommandLists and signal");
+                // SAFETY: closed lists; the fence is ours.
+                unsafe {
+                    self.queue.ExecuteCommandLists(&lists);
+                    self.queue.Signal(&self.fence, *submitted)
+                }
             };
             awake::sent(&self.device);
             self.card_sent();
             if let Err(e) = signalled {
                 fail(format_args!("a submission sent ahead could not be followed by a signal ({e})"));
             }
+            #[cfg(feature = "diagnostics")]
+            let back_part = crate::copystat::scope("submit: declared writes of the flight");
             let back = declared_writes(runs);
+            #[cfg(feature = "diagnostics")]
+            drop(back_part);
             let writes = runs.iter().flat_map(|l| l.deferred().writes.clone()).collect();
             submission_us(0, (prepared - started).saturating_sub(settled).as_micros() as u64);
             submitting(0, 0);
@@ -6976,6 +7007,8 @@ impl HostList {
         #[cfg(feature = "diagnostics")]
         let started = std::time::Instant::now();
         self._alive.used();
+        // A list's first command counts as after shader writes.
+        self.may_have_stored();
         *self.coming.lock().unwrap_or_else(|e| e.into_inner()) = None;
         *self.deferred() = Deferred::default();
         self.states.lock().unwrap_or_else(|e| e.into_inner()).clear();
@@ -7317,6 +7350,23 @@ impl HostList {
             u.writing = false;
             u.behind[0] = Some(true);
         }
+    }
+
+    /// (Merged runtime) Whether nothing that may store to a buffer was
+    /// recorded in this list since its last wait for every earlier shader
+    /// write (`crate::indirect`'s clamp leaves its own out then).
+    pub(crate) fn shader_writes_waited(&self) -> bool {
+        self.writes_waited.load(Ordering::Relaxed)
+    }
+
+    /// A wait for every earlier shader write was recorded.
+    pub(crate) fn waited_for_shader_writes(&self) {
+        self.writes_waited.store(true, Ordering::Relaxed);
+    }
+
+    /// Something that may store to a buffer is recorded.
+    pub(crate) fn may_have_stored(&self) {
+        self.writes_waited.store(false, Ordering::Relaxed);
     }
 
     /// The uses of host copies that follow belong to a new command (draw,
@@ -8038,6 +8088,7 @@ impl HostList {
                         add(C::CopyBytes, len as u64);
                     }
                     batch.title_wrote(dst, len);
+                    crate::port::copied(dst, src, len);
                     #[cfg(feature = "diagnostics")]
                     fill_check::copy_runs(dst, src, len);
                     copy_mapped(dst as *mut u8, src as *const u8, len, true);

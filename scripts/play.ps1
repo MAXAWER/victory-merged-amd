@@ -28,6 +28,13 @@ $settings = @{
     VICTORY_COPY_PLAIN = '1'; VICTORY_JOIN_PARTS = '1'; VICTORY_BACK_OWN_VIEW = '1'; VICTORY_ASYNC_SUBMIT = '1'
     VICTORY_QUEUE2 = '1'; VICTORY_TEXTURE_NO_WAIT = '1'; VICTORY_MERGE_CARD = 'check'; VICTORY_VIEW_KNOWN = '1'
     VICTORY_ASYNC_PRESENT = '1'; VICTORY_HEAP_SYNC_ASIDE = '1'
+    # the title's own 30 s watchdog off (a long first frame no longer ends the run)
+    VICTORY_NO_WATCHDOG = '1'
+    # textures without their largest level (they fit on the card: skin bakes find their sources),
+    # with time for a bake's sources to arrive
+    VICTORY_TEXTURE_DROP_MIPS = '1'; VICTORY_BAKE_TEXTURES_MS = '30000'
+    # the title's 32-bit graphics heap read in place, its buffer copies done on the card
+    VICTORY_PORT_CONSTANTS = '1'; VICTORY_CARD_STEPS = '2'
 }
 $skip = Join-Path $root 'docs\klbf\skip-amd.txt'
 if (Test-Path $skip) { $settings.VICTORY_SKIP_PIPELINES = (Get-Content $skip -Raw).Trim() }

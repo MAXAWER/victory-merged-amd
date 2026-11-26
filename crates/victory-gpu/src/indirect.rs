@@ -423,6 +423,56 @@ const IN_PARTS: u32 = 4;
 /// Records gathered from a table of offsets (vfork; bit 2 is KLBF's parts).
 const GATHERED: u32 = 8;
 
+thread_local! {
+    /// (Merged runtime) The waits for every earlier shader write that the
+    /// next clamp records: before it, after it. Both, unless [`clamp_into`]
+    /// says otherwise for its one clamp ([`clamp_waits_safe`]).
+    static CLAMP_WAITS: std::cell::Cell<(bool, bool)> = const { std::cell::Cell::new((true, true)) };
+}
+
+/// (Merged runtime) Whether a clamp leaves out the waits it does not need
+/// (`VICTORY_CLAMP_WAITS`: `safe`, the default; `all`, both as before;
+/// `alt`, twenty seconds each, said in the log).
+///
+/// The wait after the clamp: the scratch buffer it wrote is moved from
+/// unordered access to indirect arguments right there, which orders its
+/// writes before the execution reads them; the list's budget it charges is
+/// charged with atomics only. So that wait is left out.
+///
+/// The wait before it is for the title's passes that wrote the arguments:
+/// left out only while nothing that may store to a buffer was recorded in
+/// the list since its last such wait ([`HostList::shader_writes_waited`];
+/// the title's barrier groups and buffer barriers record one, and so does a
+/// clamp that keeps its own). A list's first command counts as after
+/// writes. ~1,900 clamps a frame each stood the card still twice.
+fn clamp_waits_safe() -> bool {
+    /// 0 all, 1 safe, 2 in turn.
+    static MODE: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    // `safe` by default since run clampwaits_alt (26 November): 92.5 ms a
+    // frame against 94.4, the settles' wait for the card 22.0 ms against
+    // 24.6, no artifact seen. `all`: both waits, as before.
+    match *MODE.get_or_init(|| match std::env::var("VICTORY_CLAMP_WAITS").as_deref() {
+        Ok("all") => 0,
+        Ok("alt") => 2,
+        _ => 1,
+    }) {
+        0 => false,
+        1 => true,
+        _ => {
+            static EPOCH: std::sync::OnceLock<std::time::Instant> = std::sync::OnceLock::new();
+            let on = (EPOCH.get_or_init(std::time::Instant::now).elapsed().as_secs() / 20) % 2 == 1;
+            static LAST: std::sync::atomic::AtomicU8 = std::sync::atomic::AtomicU8::new(2);
+            if LAST.swap(u8::from(on), std::sync::atomic::Ordering::Relaxed) != u8::from(on) {
+                tracing::info!(
+                    "argument clamps leave out the waits they do not need from now (VICTORY_CLAMP_WAITS=alt): {}",
+                    if on { "ON" } else { "off" }
+                );
+            }
+            on
+        }
+    }
+}
+
 /// The clamp is a command of its own that reads the title's arguments and
 /// count from their host copies (upstream VIctory #334's state tracking).
 fn sources_read(list: &HostList, src: (&ID3D12Resource, u64), count: Option<(&ID3D12Resource, u64)>) {
@@ -448,9 +498,14 @@ fn clamp_into(
     how: u32,
 ) -> bool {
     let before = list.indirect_state(dst);
+    let safe = clamp_waits_safe();
+    CLAMP_WAITS.with(|w| w.set((!(safe && list.shader_writes_waited()), !safe)));
     let recorded = record_clamp_as(c, &list.list, (dst, before), budget, src, count, spec, how);
+    CLAMP_WAITS.with(|w| w.set((true, true)));
     if recorded {
         list.indirect_readable(dst);
+        // Its wait before it stands, or the one it found standing does.
+        list.waited_for_shader_writes();
     }
     recorded
 }
@@ -542,7 +597,8 @@ fn record_clamp_as(
             D3D12_RESOURCE_STATE_INDIRECT_ARGUMENT,
         ),
     ];
-    let skip = usize::from(!waits);
+    let (want_first, want_second) = CLAMP_WAITS.with(std::cell::Cell::get);
+    let (skip, skip_second) = (usize::from(!(waits && want_first)), usize::from(!(waits && want_second)));
     unsafe {
         // Earlier shader writes (the title's argument and count passes) first.
         l.ResourceBarrier(&first[skip..]);
@@ -556,7 +612,7 @@ fn record_clamp_as(
             l.SetComputeRootUnorderedAccessView(4, budget);
             l.Dispatch(records.div_ceil(64), 1, 1);
         }
-        l.ResourceBarrier(&second[skip..]);
+        l.ResourceBarrier(&second[skip_second..]);
     }
     true
 }

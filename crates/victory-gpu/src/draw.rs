@@ -1441,6 +1441,11 @@ impl State {
         drop(set_part);
         for stage in &p.stages {
             let t = stage.translated();
+            // (Merged runtime) What may store to a buffer from here on: a
+            // later argument clamp waits for it (`crate::indirect`).
+            if t.stores || !stage.root_uavs.is_empty() || t.used.iter().any(|u| u.kind == ResourceType::Uav) {
+                list.may_have_stored();
+            }
             STORES.set(t.stores);
             let made = {
                 part!("bind: descriptor tables");
