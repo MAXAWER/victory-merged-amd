@@ -550,6 +550,21 @@ fn card_clock_line(frames: f64, ms: f64) {
     );
 }
 
+/// (victory-fork `ceb9e1f`) Whether a submission's texture checks
+/// (`crate::texture::Staging::refresh`) are gathered between writes of ours
+/// and run on the helper threads side by side (`VICTORY_PARALLEL_REFRESH=1`;
+/// off by default). At the author's boat save "textures N ms" was 11-12 ms of
+/// a frame's preparing, all on the submitting thread; measured there -8.7 and
+/// -9.4 ms of the preparing thread's work at equal draws.
+fn parallel_refresh() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var("VICTORY_PARALLEL_REFRESH").is_ok_and(|v| v == "1"))
+}
+
+/// Since the start, of [`Batch::check_textures`]: batches, textures, the
+/// threads' summed microseconds, the microseconds taken.
+static PARALLEL_CHECKS: [std::sync::atomic::AtomicU64; 4] = [const { std::sync::atomic::AtomicU64::new(0) }; 4];
+
 /// Of the preparing: title memory copies (microseconds, bytes) and texture
 /// refreshes (microseconds, bytes hashed), since the last frame-rate line.
 pub(crate) static PREPARING: [std::sync::atomic::AtomicU64; 4] = [
@@ -728,6 +743,19 @@ fn create() -> windows::core::Result<Host> {
             );
             tracing::info!(ok = set.is_ok(), "the host's background shader work is switched off (VICTORY_D3D12_BACKGROUND=0)");
         }
+        // (Merged runtime) Whether the CPU can map the card's own memory
+        // (`D3D12_HEAP_TYPE_GPU_UPLOAD`: resizable BAR on, and a system and
+        // driver that offer it), for the log: buffers the CPU fills could then
+        // lie in the card's memory with no copy in the PC's.
+        let mut o16 = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+        let o16_ok = device
+            .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut o16).cast(), size_of_val(&o16) as u32)
+            .is_ok();
+        tracing::info!(
+            asked = o16_ok,
+            supported = o16_ok && o16.GPUUploadHeapSupported.as_bool(),
+            "card memory the CPU maps (D3D12_HEAP_TYPE_GPU_UPLOAD)"
+        );
         // the widest wave the GPU runs: 32 (NVIDIA) gets console wave64 compute programs whose
         // cross-lane code stays in 32-lane halves translated for waves of 32
         let mut o1 = D3D12_FEATURE_DATA_D3D12_OPTIONS1::default();
@@ -5967,10 +5995,18 @@ impl Host {
     /// the air, at the next point where what they do can be observed
     /// ([`late`] lists those points); their host lists are reset and kept
     /// for reuse then, as a queue does for the lists it ran.
-    pub(crate) fn execute_late(&self, lists: Vec<crate::list::Detached>, order: Vec<usize>) {
+    pub(crate) fn execute_late(&self, mut lists: Vec<crate::list::Detached>, mut order: Vec<usize>) {
         if order.is_empty() {
             crate::list::recycle(lists, &order);
             return;
+        }
+        // Textures uploaded ahead (`crate::heap_worker`): their lists run
+        // before the title's.
+        let ahead = crate::heap_worker::take_ready();
+        if !ahead.is_empty() {
+            let first = lists.len();
+            order.splice(0..0, first..first + ahead.len());
+            lists.extend(ahead.into_iter().map(crate::list::Detached::ours));
         }
         late_threads();
         let sent = {
@@ -8067,6 +8103,22 @@ impl HostList {
         self.deferred().copies.push(Step::Texture(staging));
     }
 
+    /// (victory-fork `d4a528b`) Detiles the textures the list uploads now,
+    /// ahead of its submission ([`crate::texture::Staging::refresh_ahead`]);
+    /// how many were left.
+    pub(crate) fn refresh_textures_ahead(&self) -> u64 {
+        let textures: Vec<_> = self
+            .deferred()
+            .copies
+            .iter()
+            .filter_map(|step| match step {
+                Step::Texture(staging) => Some(staging.clone()),
+                _ => None,
+            })
+            .collect();
+        textures.iter().filter(|staging| !staging.refresh_ahead()).count() as u64
+    }
+
     /// Runs the list's submission-time steps; refreshes go into `batch`
     /// (the title's big buffers, a 174 MB one among them, are read by most
     /// lists of a submission, through many ranges). Copies and fills that
@@ -8151,7 +8203,15 @@ impl HostList {
                 }
                 Step::Texture(staging) => {
                     if batch.texture_due(staging) {
-                        staging.refresh();
+                        if parallel_refresh() {
+                            // (victory-fork `ceb9e1f`) Checked with the
+                            // others of the batch, several at a time, before
+                            // the next step that writes title memory
+                            // ([`Batch::check_textures`]).
+                            batch.due_textures.push(staging.clone());
+                        } else {
+                            staging.refresh();
+                        }
                     }
                     continue;
                 }
@@ -8362,9 +8422,52 @@ struct Batch {
     current: std::collections::HashMap<usize, (std::sync::Arc<crate::shadow::Shadow>, usize, usize)>,
     /// Staging buffers (by address) refreshed since the last title write.
     textures: std::collections::HashSet<usize>,
+    /// With [`parallel_refresh`]: textures due a check, not checked yet
+    /// ([`Batch::check_textures`], before any write of ours and at every
+    /// flush).
+    due_textures: Vec<std::sync::Arc<crate::texture::Staging>>,
 }
 
 impl Batch {
+    /// (victory-fork `ceb9e1f`) With [`parallel_refresh`]: checks the
+    /// textures due on the helper threads (`crate::shadow::wide_run`, the
+    /// submitting thread among them), all done before it returns.
+    fn check_textures(&mut self) {
+        use std::sync::atomic::Ordering::Relaxed;
+        if self.due_textures.is_empty() {
+            return;
+        }
+        let due = std::mem::take(&mut self.due_textures);
+        PARALLEL_CHECKS[0].fetch_add(1, Relaxed);
+        PARALLEL_CHECKS[1].fetch_add(due.len() as u64, Relaxed);
+        if due.len() < 2 {
+            for staging in due {
+                staging.refresh();
+            }
+            return;
+        }
+        let started = std::time::Instant::now();
+        let before = PREPARING[2].load(Relaxed);
+        let jobs: Vec<Box<dyn FnOnce() + Send>> = due
+            .into_iter()
+            .map(|staging| Box::new(move || { staging.refresh(); }) as Box<dyn FnOnce() + Send>)
+            .collect();
+        crate::shadow::wide_run(jobs);
+        let summed = PREPARING[2].load(Relaxed).saturating_sub(before);
+        let wall = started.elapsed().as_micros() as u64;
+        PREPARING[2].fetch_sub(summed.saturating_sub(wall), Relaxed);
+        PARALLEL_CHECKS[2].fetch_add(summed, Relaxed);
+        PARALLEL_CHECKS[3].fetch_add(wall, Relaxed);
+        if PARALLEL_CHECKS[0].load(Relaxed).is_multiple_of(1 << 14) {
+            let [b, n, sum, w] = [0, 1, 2, 3].map(|i| PARALLEL_CHECKS[i].load(Relaxed));
+            tracing::info!(
+                "texture checks side by side (VICTORY_PARALLEL_REFRESH) so far: {b} batches, {n} textures; the threads' sum {} ms, the time taken {} ms",
+                sum / 1000,
+                w / 1000
+            );
+        }
+    }
+
     fn add(&mut self, shadow: &std::sync::Arc<crate::shadow::Shadow>, address: usize, len: usize) {
         let end = address + len;
         let key = std::sync::Arc::as_ptr(shadow) as usize;
@@ -8449,6 +8552,7 @@ impl Batch {
     /// Before a step that writes title memory: pending refreshes are done
     /// first, and textures are checked again after it.
     fn title_written(&mut self) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         // Where it writes is not known: no copy counts as up to date.
@@ -8460,6 +8564,7 @@ impl Batch {
     /// in this submission that holds some of those bytes, the larger part
     /// beside them stays so.
     fn title_wrote(&mut self, at: usize, len: usize) {
+        self.check_textures();
         self.flush();
         self.textures.clear();
         let end = at + len;
@@ -8479,6 +8584,7 @@ impl Batch {
     }
 
     fn flush(&mut self) {
+        self.check_textures();
         self.index.clear();
         // One write-watch asking for the copies that lie close together,
         // not one per copy.
@@ -9308,6 +9414,18 @@ impl Meter {
         let picked = crate::draw::HEAP_BUFFER_PASSES.swap(0, Ordering::Relaxed) as f64 / frames;
         let picked_ms =
             crate::draw::HEAP_BUFFER_MICROS.swap(0, Ordering::Relaxed) as f64 / 1e3 / frames;
+        {
+            let [busy, detiling, lists, shown, again, left] =
+                std::array::from_fn::<f64, 6, _>(|i| crate::heap_worker::STATS[i].swap(0, Ordering::Relaxed) as f64 / frames);
+            if busy > 0.0 {
+                tracing::info!(
+                    "textures picked by index, their own thread (VICTORY_HEAP_WORKER), per frame: {:.1} ms at work, of them {:.1} detiling; \
+                     {lists:.1} lists, {shown:.0} slots shown, {again:.1} written again before, {left:.1} textures left to the submission",
+                    busy / 1e6,
+                    detiling / 1e6
+                );
+            }
+        }
         // Copies between depth textures and their colour twins, each way.
         let [twin_to_depth, twin_to_colour] =
             [2, 3].map(|i| crate::resource::TWINS[i].swap(0, Ordering::Relaxed) as f64 / frames);
@@ -9974,6 +10092,72 @@ impl Host {
             }
             Err(e) => {
                 tracing::warn!(error = %e, size, "no shared buffer");
+                None
+            }
+        }
+    }
+
+    /// (Merged runtime, from avatarmanz bd68f5e17) Whether buffers can lie
+    /// in the card's memory and be mapped by the CPU
+    /// (`D3D12_HEAP_TYPE_GPU_UPLOAD`: a resizable BAR, and a system and
+    /// driver that offer it).
+    pub(crate) fn mapped_card_memory(&self) -> bool {
+        static THERE: OnceLock<bool> = OnceLock::new();
+        *THERE.get_or_init(|| {
+            let mut options = D3D12_FEATURE_DATA_D3D12_OPTIONS16::default();
+            // SAFETY: writes `options` of the given size.
+            let ok = unsafe {
+                self.device
+                    .CheckFeatureSupport(D3D12_FEATURE_D3D12_OPTIONS16, (&raw mut options).cast(), size_of_val(&options) as u32)
+                    .is_ok()
+            };
+            ok && options.GPUUploadHeapSupported.as_bool()
+        })
+    }
+
+    /// (Merged runtime, from avatarmanz bd68f5e17) A buffer in the card's own
+    /// memory that the CPU maps and shaders read (with `written`, may write
+    /// too). The CPU should only write it: a read of the mapping crosses the
+    /// bus a few bytes at a time.
+    pub(crate) fn mapped_card_buffer(&self, size: u64, written: bool) -> Option<(ID3D12Resource, *mut u8)> {
+        if !self.mapped_card_memory() {
+            return None;
+        }
+        MADE[4].fetch_add(1, Ordering::Relaxed);
+        MADE[5].fetch_add(size, Ordering::Relaxed);
+        let heap = D3D12_HEAP_PROPERTIES {
+            Type: D3D12_HEAP_TYPE_GPU_UPLOAD,
+            ..Default::default()
+        };
+        let desc = D3D12_RESOURCE_DESC {
+            Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
+            Width: size.max(1),
+            Height: 1,
+            DepthOrArraySize: 1,
+            MipLevels: 1,
+            SampleDesc: DXGI_SAMPLE_DESC { Count: 1, Quality: 0 },
+            Layout: D3D12_TEXTURE_LAYOUT_ROW_MAJOR,
+            Flags: if written { D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS } else { D3D12_RESOURCE_FLAG_NONE },
+            ..Default::default()
+        };
+        let mut buffer: Option<ID3D12Resource> = None;
+        let mut data = std::ptr::null_mut();
+        // SAFETY: plain creation and mapping of a CPU-visible buffer.
+        let made = unsafe {
+            self.device
+                .CreateCommittedResource(&heap, D3D12_HEAP_FLAG_NONE, &desc, D3D12_RESOURCE_STATE_COMMON, None, &mut buffer)
+                .and_then(|()| {
+                    let b = buffer.as_ref().ok_or_else(windows::core::Error::empty)?;
+                    b.Map(0, None, Some(&mut data))
+                })
+        };
+        match made {
+            Ok(()) => Some((buffer?, data.cast())),
+            Err(e) => {
+                static SAID: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+                if SAID.fetch_add(1, Ordering::Relaxed) < 8 {
+                    tracing::warn!(error = %e, size, "no buffer in card memory the CPU maps");
+                }
                 None
             }
         }

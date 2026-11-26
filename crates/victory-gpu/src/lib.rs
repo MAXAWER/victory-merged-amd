@@ -43,6 +43,8 @@ pub mod frame;
 #[cfg(windows)]
 pub mod framelog;
 #[cfg(windows)]
+mod heap_worker;
+#[cfg(windows)]
 mod host;
 #[cfg(windows)]
 mod indirect;
@@ -50,6 +52,9 @@ mod indirect;
 mod inplace;
 #[cfg(windows)]
 mod port;
+/// (Merged runtime, avatarmanz `9997d25`) Renderer port 2.
+#[cfg(windows)]
+pub mod port_descriptors;
 pub mod list;
 pub mod object;
 pub mod pipeline;

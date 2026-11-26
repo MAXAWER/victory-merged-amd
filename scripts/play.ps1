@@ -30,6 +30,13 @@ $settings = @{
     VICTORY_ASYNC_PRESENT = '1'; VICTORY_HEAP_SYNC_ASIDE = '1'
     # the title's own 30 s watchdog off (a long first frame no longer ends the run)
     VICTORY_NO_WATCHDOG = '1'
+    # windows get a card side while the card is under 90 % of its budget (less RAM shared)
+    VICTORY_CARD_WINDOWS_PERCENT = '90'
+    # 2026-11-26 evening (median 113 -> 87 ms a frame, far fewer long frames): the texture pass
+    # on its own thread (victory-fork), renderer port 2 (avatarmanz: the title's descriptor
+    # stores tell their slots), more room for flights (victory-fork)
+    VICTORY_HEAP_WORKER = '1'; VICTORY_PORT_DESCRIPTORS = '1'
+    VICTORY_LATE_WAIT_LISTS = '512'; VICTORY_MERGE_RUNS = '4096'
     # (VICTORY_TEXTURE_DROP_MIPS=1, VICTORY_BAKE_TEXTURES_MS=30000, VICTORY_PORT_CONSTANTS=1 and
     # VICTORY_CARD_STEPS=2 are off again: they were judged on a quiet scene only and are being
     # checked against the cutscenes; see PORTING.md.)

@@ -11,6 +11,11 @@ mod run;
 mod shader;
 mod translate;
 
+/// (Merged runtime) With the `mimalloc` feature, the layer's own heap.
+#[cfg(feature = "mimalloc")]
+#[global_allocator]
+static GLOBAL: mimalloc::MiMalloc = mimalloc::MiMalloc;
+
 use std::path::PathBuf;
 
 use anyhow::Result;

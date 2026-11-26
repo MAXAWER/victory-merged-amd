@@ -16,6 +16,7 @@ victory-shader = { workspace = true, features = ["host"] }
 victory-game.workspace = true
 victory-gpu.workspace = true
 tracing.workspace = true
+mimalloc = { version = "0.1", default-features = false, optional = true }
 anyhow.workspace = true
 blake3.workspace = true
 memchr.workspace = true
@@ -26,6 +27,9 @@ walkdir.workspace = true
 windows-sys = { workspace = true, features = ["Win32_System_Memory"] }
 
 [features]
+# (Merged runtime) mimalloc in place of the system heap for the layer's own
+# allocations: the translating and preparing threads allocate a lot.
+mimalloc = ["dep:mimalloc"]
 # Debug-level logs and the debugging switches (frame capture, stack dumps,
 # the host debug layer, scripted keys). Off in a plain release build.
 diagnostics = [

@@ -471,6 +471,14 @@ impl Update {
         let display = self.display.as_deref();
         let display = display.or(current.as_ref().map(|v| v.display.as_str()));
         let number = current.as_ref().map_or(1, |v| v.number + 1);
+        let shown = display.unwrap_or("");
+        tracing::info!(
+            container = %self.name,
+            version = number,
+            shown,
+            changes = ?self.changes.iter().map(|(n, d)| (n.as_str(), d.as_ref().map(Vec::len))).collect::<Vec<_>>(),
+            "game save written"
+        );
         if let Err(e) = commit(&self.dir, number, &self.name, display.unwrap_or(""), &blobs) {
             return io_error(&self.dir, &e);
         }
@@ -510,14 +518,22 @@ fn read(c: &Container, names: Option<Vec<String>>) -> Result<Vec<(String, Vec<u8
         .map_err(|e| io_error(&c.dir, &e))?
         .ok_or(BLOB_NOT_FOUND)?;
     let names = names.unwrap_or_else(|| version.blobs.clone());
-    names
+    let blobs: Result<Vec<(String, Vec<u8>)>, HRESULT> = names
         .into_iter()
         .map(|name| {
             let i = version.blobs.iter().position(|b| *b == name).ok_or(BLOB_NOT_FOUND)?;
             let data = std::fs::read(version.blob(i)).map_err(|e| io_error(&c.dir, &e))?;
             Ok((name, data))
         })
-        .collect()
+        .collect();
+    if let Ok(blobs) = &blobs {
+        tracing::info!(
+            container = %c.name,
+            blobs = ?blobs.iter().map(|(n, d)| (n.as_str(), d.len())).collect::<Vec<_>>(),
+            "game save read"
+        );
+    }
+    blobs
 }
 
 /// One blob as the public API lays it out: name, size, data.

@@ -159,6 +159,39 @@ fn census() {
         crate::shadow::PAGEABLE[0].load(std::sync::atomic::Ordering::Relaxed),
         crate::shadow::PAGEABLE[1].load(std::sync::atomic::Ordering::Relaxed) >> 20
     );
+    // (Merged runtime) Where the host copies' bytes lie: what of the PC's
+    // memory shared with the card is ours to move.
+    for (kind, rows) in ["windows", "title buffer copies"].iter().zip(crate::shadow::where_copies_lie()) {
+        let f = |(n, b): (u64, u64)| format!("{n} ({} MB)", b >> 20);
+        tracing::info!(
+            "memory census: {kind}: in place {}, on the card only {}, on the card with a CPU side in shared memory {}, on the card with a CPU side in the process's memory {}, in shared memory only {}",
+            f(rows[0]),
+            f(rows[1]),
+            f(rows[2]),
+            f(rows[3]),
+            f(rows[4])
+        );
+    }
+    tracing::info!(
+        "memory census: transient windows in card memory the CPU maps (VICTORY_WINDOWS_BAR=1): {} ({} MB)",
+        crate::shadow::WINDOWS_BAR[0].load(std::sync::atomic::Ordering::Relaxed),
+        crate::shadow::WINDOWS_BAR[1].load(std::sync::atomic::Ordering::Relaxed) >> 20
+    );
+    let a = |i: usize| crate::host::ALIVE[i].load(std::sync::atomic::Ordering::Relaxed);
+    let m = |i: usize| crate::host::MADE[i].load(std::sync::atomic::Ordering::Relaxed);
+    tracing::info!(
+        "memory census: upload memory of lists: scratch chunks {} ({} MB), other upload buffers {} ({} MB); made since the start: upload {} ({} MB), shared {} ({} MB), card {} ({} MB)",
+        a(1),
+        a(2) >> 20,
+        a(6),
+        a(7) >> 20,
+        m(0),
+        m(1) >> 20,
+        m(2),
+        m(3) >> 20,
+        m(4),
+        m(5) >> 20
+    );
     let r = |i: usize| crate::texture::RELEASED[i].load(std::sync::atomic::Ordering::Relaxed);
     tracing::info!(
         "memory census: texture staging buffers alive {} ({} MB); since the start {} let go after their upload ({} MB) and {} taken anew ({} MB)",

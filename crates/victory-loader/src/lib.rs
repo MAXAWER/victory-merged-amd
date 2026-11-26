@@ -21,6 +21,9 @@
 //!    point on a thread with the stack size the image asks for; from then
 //!    on, pass every thread start and end on to the attached images.
 
+/// (Merged runtime, avatarmanz `9997d25`) Renderer port 2's patched stores.
+#[cfg(windows)]
+pub mod descriptor_sites;
 #[cfg(windows)]
 mod console_insn;
 mod crash;

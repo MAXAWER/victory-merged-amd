@@ -18,8 +18,9 @@ Windows 11, Series S profile with FSR 4 (FidelityFX SDK 2.4).
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| A quiet scene in the world (a prison cell) | about 10-11 fps (90-97 ms a frame); 4.4 fps before the merges |
-| Picture | lit, textured; the indirect light is estimated from the frame (no blocks of stale probe memory); the opening cutscene runs at **1.5-4 fps** with frames of 1-5 s while it streams, and is full of artifacts: washed-out and white frames, flicker, black or broken faces, stray hair strands; quiet scenes look right except for black skin of some characters |
+| Cutscenes after the prologue's first save (evening build) | median **87 ms a frame (11.5 fps)**, 16-19 fps in close-ups; 90 % of frames under 175 ms (was median 113, 90 % under 886 ms) |
+| A quiet scene in the world (a prison cell) | about 10-12 fps; 4.4 fps before the merges |
+| Picture | faces right in the cutscenes measured (16-bit values of the face network now move unchanged), no white or black flashes in them; long frames of 1.5-3 s at loads come from the PC running out of RAM (page faults), not from the renderer |
 | Stability | 7-15 minute runs without a crash; the device losses in the meshlet culling are fixed (raw twins) |
 | Memory | about 21 GB private, pagefile 32-48 GB recommended with 16 GB of RAM |
 
@@ -55,6 +56,11 @@ Each entry names its source; details, conflicts and measurements are in
   on), the 64 KiB cap on constant buffer views.
 - **ccs03**: the present that waits for the one before it (ported, off by default here:
   `VICTORY_ASYNC_PRESENT_WAIT_MS`), write-watch lock patches (kept aside).
+- **victory-fork** (evening of 2026-11-26): 16-bit values through unsigned twin views (PR #927
+  by tippythetaidum, mouths and faces), the texture pass on its own thread (PR #1007,
+  `VICTORY_HEAP_WORKER`), parallel texture checks (`VICTORY_PARALLEL_REFRESH`, off: slower here).
+- **avatarmanz** (evening): renderer port 2 (`VICTORY_PORT_DESCRIPTORS`: six descriptor stores of
+  the title patched to tell their slots), the light stand-in settling by time (`VICTORY_AMBIENT_SETTLE`).
 - **[vitutu1/victory-perf](https://github.com/vitutu1/victory-perf)** (after ZigZagBoi1/ScarlettPort): the loader hooks that
   take out the title's own watchdog (`VICTORY_NO_WATCHDOG`) and set its render scale.
 - **victory-fork #814** (staronthehorizon, by way of ccs03): textures without their largest

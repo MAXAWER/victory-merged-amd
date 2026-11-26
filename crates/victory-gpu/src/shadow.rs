@@ -107,6 +107,11 @@ struct Card {
     /// (offset, end, the upload memory holding their bytes), in the order
     /// they were copied.
     chunks: Mutex<Vec<(usize, usize, crate::windowup::Chunk)>>,
+    /// (Merged runtime, [`windows_bar`]) Of a transient window whose card
+    /// side lies in card memory the CPU maps: that mapping (null: none). The
+    /// title's bytes are copied straight into it at refresh, with no chunk
+    /// and no copy on the card.
+    mapped: *mut u8,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -456,6 +461,114 @@ pub(crate) fn stale_report(top: usize) -> (u64, Vec<String>) {
     (total, lines)
 }
 
+/// (Merged runtime, for the memory census) The host copies alive, by where
+/// their bytes lie: for windows, then for title buffers, each as (count,
+/// bytes) of: in place (the title's own memory), on the card only (no CPU
+/// side), on the card with a CPU side in memory shared with the card, on the
+/// card with a CPU side in the process's own memory, and in memory shared with
+/// the card only (the card reads them over the bus).
+pub(crate) fn where_copies_lie() -> [[(u64, u64); 5]; 2] {
+    let mut out = [[(0u64, 0u64); 5]; 2];
+    let mut add = |kind: usize, s: &Shadow| {
+        let at = if s.in_place() {
+            0
+        } else {
+            match &s.card {
+                Some(card) if card.pageable => 3,
+                Some(card) if card.staging.is_some() => 2,
+                Some(_) => 1,
+                None => 4,
+            }
+        };
+        out[kind][at].0 += 1;
+        out[kind][at].1 += s.len;
+    };
+    for s in LOOSE.lock().unwrap_or_else(|e| e.into_inner()).values() {
+        add(0, s);
+    }
+    for entry in buffers().values() {
+        if let Some(s) = &entry.shadow {
+            add(1, s);
+        }
+    }
+    out
+}
+
+/// (Merged runtime, after avatarmanz bd68f5e17) Whether a transient window's
+/// card side lies in card memory the CPU maps (`VICTORY_WINDOWS_BAR=1`; off
+/// by default; needs `D3D12_HEAP_TYPE_GPU_UPLOAD`, a resizable BAR). The
+/// title's changed bytes are then copied at refresh straight into the card's
+/// memory over the bus: no chunk of upload memory in the PC's memory shared
+/// with the card (`crate::windowup`, 512 MB and more) and no copy on the
+/// card before the submission.
+///
+/// What it assumes: a submission still on the card that reads the window
+/// reads what the title has there now, as on the console, where the card
+/// reads the title's memory itself (the title does not write what the card
+/// is still reading). Only the bytes the title wrote are copied.
+pub(crate) fn windows_bar() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let asked = std::env::var_os("VICTORY_WINDOWS_BAR").is_some_and(|v| v == "1");
+        let on = asked && window_upload() && host().is_some_and(|h| h.mapped_card_memory());
+        if asked {
+            tracing::info!(on, "transient windows in card memory the CPU maps (VICTORY_WINDOWS_BAR=1; needs VICTORY_CARD_WINDOW_UPLOAD=1 and a resizable BAR)");
+        }
+        on
+    })
+}
+
+/// (Merged runtime) The share of the card's budget, in percent, up to which
+/// windows get a card side (`VICTORY_CARD_WINDOWS_PERCENT`, 80 as before;
+/// 50 to 95). Past it a window is made in the PC's memory shared with the
+/// card, where every draw reads it over the bus.
+fn window_card_percent() -> u64 {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    *PERCENT.get_or_init(|| {
+        std::env::var("VICTORY_CARD_WINDOWS_PERCENT")
+            .ok()
+            .and_then(|v| v.trim().parse::<u64>().ok())
+            .map_or(80, |p| p.clamp(50, 95))
+    })
+}
+
+/// Transient windows in card memory the CPU maps ([`windows_bar`]) alive,
+/// and their bytes.
+pub(crate) static WINDOWS_BAR: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// A buffer in the card's memory for a window of `size` bytes, if it is to
+/// be there ([`window_card_most`]), with its mapping when it lies in card
+/// memory the CPU maps ([`windows_bar`]; null otherwise).
+fn window_card_mapped_for(size: u64) -> Option<(ID3D12Resource, *mut u8)> {
+    if !windows_bar() {
+        return window_card_for(size).map(|b| (b, std::ptr::null_mut()));
+    }
+    let host = host()?;
+    if !host.card_ready() || window_card_most() == 0 || !cards() {
+        return None;
+    }
+    if let Some([budget, used, ..]) = host.video_memory()
+        && used + size > budget / 100 * window_card_percent()
+    {
+        return None;
+    }
+    if WINDOW_CARD_BYTES.fetch_add(size, Ordering::Relaxed) + size > window_card_most() {
+        WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+        return None;
+    }
+    match host.mapped_card_buffer(size, false) {
+        Some(made) => {
+            WINDOWS_BAR[0].fetch_add(1, Ordering::Relaxed);
+            WINDOWS_BAR[1].fetch_add(size, Ordering::Relaxed);
+            Some(made)
+        }
+        None => {
+            WINDOW_CARD_BYTES.fetch_sub(size, Ordering::Relaxed);
+            None
+        }
+    }
+}
+
 /// A buffer in the card's memory for a window of `size` bytes, if it is to
 /// be there ([`window_card_most`]).
 fn window_card_for(size: u64) -> Option<ID3D12Resource> {
@@ -468,7 +581,7 @@ fn window_card_for(size: u64) -> Option<ID3D12Resource> {
         return None;
     }
     if let Some([budget, used, ..]) = host.video_memory()
-        && used + size > budget / 10 * 8
+        && used + size > budget / 100 * window_card_percent()
     {
         return None;
     }
@@ -2266,6 +2379,10 @@ impl Drop for Shadow {
             if window && card.staging.is_none() && !card.pageable {
                 TRANSIENT[0].fetch_sub(1, Ordering::Relaxed);
                 TRANSIENT[1].fetch_sub(self.len, Ordering::Relaxed);
+                if !card.mapped.is_null() {
+                    WINDOWS_BAR[0].fetch_sub(1, Ordering::Relaxed);
+                    WINDOWS_BAR[1].fetch_sub(card.size, Ordering::Relaxed);
+                }
             }
             if card.pageable && !data.is_null() {
                 use windows_sys::Win32::System::Memory::{MEM_RELEASE, VirtualFree};
@@ -3698,6 +3815,15 @@ impl Shadow {
             return 0;
         }
         let n = to - from;
+        if !card.mapped.is_null() {
+            // (Merged runtime, [`windows_bar`]) Straight into the card's
+            // memory: the offsets lie inside the window's card side.
+            // SAFETY: `from..to` lies inside the window, and its card side
+            // maps the window's bytes.
+            crate::host::copy_mapped(unsafe { card.mapped.add(from - self.start as usize) }, from as *const u8, n, false);
+            crate::windowup::SENT.fetch_add(n as u64, Ordering::Relaxed);
+            return n;
+        }
         let Some(chunk) = crate::windowup::alloc(n as u64) else {
             crate::host::fail(format_args!("no upload memory for a window of title memory ({n} bytes)"));
         };
@@ -4336,6 +4462,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             let card = Card {
                 staging: None,
                 pageable: true,
+                mapped: std::ptr::null_mut(),
                 chunks: Mutex::default(),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
@@ -4359,6 +4486,7 @@ fn lookup_tables(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     let card = Card {
                         staging: Some(buffer),
                         pageable: false,
+                        mapped: std::ptr::null_mut(),
                         chunks: Mutex::default(),
                         before: Mutex::default(),
                         dirty: Mutex::default(),
@@ -4636,6 +4764,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.card = Some(Card {
         staging,
         pageable,
+        mapped: std::ptr::null_mut(),
         chunks: Mutex::default(),
         before: Mutex::default(),
         dirty: Mutex::default(),
@@ -4691,14 +4820,15 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
     // (Neptune) With `window_upload`, a window that gets a card side keeps no
     // CPU side (a transient window): no buffer in the PC's memory shared
     // with the card. One that gets none is made as before.
-    let transient = if window_upload() { window_card_for(len) } else { None };
-    let (buffer, data, card) = if let Some(on_card) = transient {
+    let transient = if window_upload() { window_card_mapped_for(len) } else { None };
+    let (buffer, data, card) = if let Some((on_card, mapped)) = transient {
         crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card (transient)"));
         TRANSIENT[0].fetch_add(1, Ordering::Relaxed);
         TRANSIENT[1].fetch_add(len, Ordering::Relaxed);
         let card = Card {
             staging: None,
             pageable: false,
+            mapped,
             chunks: Mutex::default(),
             before: Mutex::default(),
             dirty: Mutex::default(),
@@ -4717,6 +4847,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
                 let card = Card {
                     staging: Some(buffer),
                     pageable: false,
+                    mapped: std::ptr::null_mut(),
                     chunks: Mutex::default(),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
@@ -5000,6 +5131,7 @@ mod card_merge_tests {
             shadow.card = Some(Card {
                 staging: Some(staging.clone()),
                 pageable: false,
+                mapped: std::ptr::null_mut(),
                 chunks: Mutex::default(),
                 before: Mutex::new(None),
                 dirty: Mutex::default(),

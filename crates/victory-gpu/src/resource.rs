@@ -1207,6 +1207,26 @@ fn textures() -> std::sync::MutexGuard<'static, std::collections::BTreeSet<usize
     TEXTURES.lock().unwrap_or_else(|e| e.into_inner())
 }
 
+/// A title texture held alive ([`hold`]).
+#[cfg(windows)]
+pub(crate) struct Held(This);
+
+#[cfg(windows)]
+impl Drop for Held {
+    fn drop(&mut self) {
+        crate::object::release_boxed::<Resource>(self.0);
+    }
+}
+
+/// Holds title texture `this` alive, for work on a thread the title knows
+/// nothing of. `None` if it is no texture, or is being released.
+#[cfg(windows)]
+pub(crate) fn hold(this: This) -> Option<Held> {
+    // A texture leaves the table before it is freed, under this lock.
+    let all = textures();
+    (all.contains(&(this as usize)) && crate::object::add_ref_alive(this)).then(|| Held(this))
+}
+
 /// The title textures the host renders to or writes (targets, depth,
 /// unordered access), by the address of their memory: what a view the
 /// title places in that memory in another format shows ([`alias_of`]). A
@@ -1614,6 +1634,35 @@ pub(crate) fn room_lately() -> bool {
     let room = room();
     LAST.store((tenth << 1) | u64::from(room), Relaxed);
     room
+}
+
+/// Whether a bake draw's own sources may still be made while [`room`] says
+/// no: up to a higher share of the card's budget, 96 percent unless
+/// `VICTORY_BAKE_ROOM_PERCENT` says another (from [`room_percent`] to 98;
+/// 0: never). A bake samples its sources once, and what it bakes from a
+/// texture never made stays for the run (black faces); a few dozen MB past
+/// the line are worth that, and the line keeps the rest of the queue
+/// waiting. Not with `VICTORY_TEXTURE_BUDGET_MB`, a limit of its own.
+#[cfg(windows)]
+pub(crate) fn room_for_bake() -> bool {
+    static PERCENT: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+    let percent = *PERCENT.get_or_init(|| {
+        if std::env::var_os("VICTORY_TEXTURE_BUDGET_MB").is_some() {
+            return 0;
+        }
+        match std::env::var("VICTORY_BAKE_ROOM_PERCENT").ok().and_then(|v| v.trim().parse::<u64>().ok()) {
+            Some(0) => 0,
+            Some(percent) => percent.clamp(room_percent(), 98),
+            None => 96u64.max(room_percent()),
+        }
+    });
+    if percent == 0 {
+        return false;
+    }
+    match crate::host::host().and_then(|h| h.video_memory()) {
+        Some([budget, used, ..]) => used < budget / 100 * percent,
+        None => false,
+    }
 }
 
 /// The share of the card's budget, in percent, up to which host copies of

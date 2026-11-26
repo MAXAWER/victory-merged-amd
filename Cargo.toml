@@ -77,3 +77,11 @@ debug = "line-tables-only"
 # kept in its own folder so it does not evict the plain release build.
 [profile.diag]
 inherits = "release"
+
+# (Merged runtime) The build to play with: release code generation with
+# whole-program optimisation (`cargo build --profile ship -p victory`; slow to
+# link). The CPU side is the frame's limit, so the translator's own code counts.
+[profile.ship]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
