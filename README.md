@@ -18,8 +18,8 @@ Windows 11, Series S profile with FSR 4 (FidelityFX SDK 2.4).
 | | |
 |---|---|
 | Menus, videos, loading screens | 30 fps |
-| Opening scenes, in the world | **about 12 fps** (85 ms a frame; 97 ms in the same session without the newest four switches of `scripts\play.ps1`); 4.4 fps before the merges |
-| Picture | lit, textured; the indirect light is estimated from the frame (no blocks of stale probe memory); eyes and hands of the characters baked right now (textures without their largest level fit on the card); faces in dark interiors are still black |
+| A quiet scene in the world (a prison cell) | about 10-11 fps (90-97 ms a frame); 4.4 fps before the merges |
+| Picture | lit, textured; the indirect light is estimated from the frame (no blocks of stale probe memory); the opening cutscene runs at **1.5-4 fps** with frames of 1-5 s while it streams, and is full of artifacts: washed-out and white frames, flicker, black or broken faces, stray hair strands; quiet scenes look right except for black skin of some characters |
 | Stability | 7-15 minute runs without a crash; the device losses in the meshlet culling are fixed (raw twins) |
 | Memory | about 21 GB private, pagefile 32-48 GB recommended with 16 GB of RAM |
 
