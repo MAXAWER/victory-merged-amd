@@ -102,6 +102,41 @@ pub(crate) struct Shadow {
     /// and the bytes from the buffer's first byte to `start` (the heap
     /// begins on a 64 KiB line; a title buffer need not).
     place: Option<(windows::Win32::Graphics::Direct3D12::ID3D12Heap, u64)>,
+    /// (Merged runtime, [`card_side_pageable`]) `data` is the process's own
+    /// memory of this many bytes, freed when the copy goes (0: `data` is a
+    /// host buffer's mapping).
+    own_side: u64,
+}
+
+/// (Merged runtime) Whether the CPU side of a title buffer's copy in the
+/// card's memory is the process's own memory (`VICTORY_CARD_SIDE_PAGEABLE=1`;
+/// off by default), not a buffer in memory shared with the card.
+///
+/// The card never reads the CPU side with the sends taken into a submission's
+/// own memory (`crate::host::send`, on by default): it is only what title
+/// memory is compared with and what landings are merged into. As a buffer in
+/// shared memory it is locked into the PC's memory for as long as the copy
+/// lives, all of it: 159 such sides of 32 MiB and 174 of 16 MiB held 6 GB of
+/// a PC of 32 GB whose memory was full (the map of 2026-11-27; frames of
+/// 0.2 to 0.9 s with the process idle). In the process's own memory Windows
+/// may take out what is not touched, and what is touched is the pages the
+/// title changes. Needs the sends in the submission's own memory.
+pub(crate) fn card_side_pageable() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        std::env::var_os("VICTORY_CARD_SIDE_PAGEABLE").is_some_and(|v| v == "1") && crate::host::sends_own()
+    })
+}
+
+/// CPU sides alive in the process's own memory and their bytes.
+pub(crate) static PAGEABLE: [AtomicU64; 2] = [const { AtomicU64::new(0) }; 2];
+
+/// `size` bytes of the process's own memory, zeros, for a CPU side.
+fn pageable_side(size: u64) -> Option<*mut u8> {
+    use windows_sys::Win32::System::Memory::{MEM_COMMIT, MEM_RESERVE, PAGE_READWRITE, VirtualAlloc};
+    // SAFETY: a fresh allocation of our own.
+    let at = unsafe { VirtualAlloc(std::ptr::null(), size as usize, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+    (!at.is_null()).then_some(at.cast())
 }
 
 /// What a copy in the card's memory ([`cards`]) has beside the buffer
@@ -109,8 +144,9 @@ pub(crate) struct Shadow {
 struct Card {
     /// The CPU's side, in the PC's memory: what `data` maps. Title memory
     /// is copied into it as into any copy, and what changed in it goes to
-    /// the card's side before the next submission.
-    staging: ID3D12Resource,
+    /// the card's side before the next submission. `None`: the CPU's side
+    /// is the process's own memory ([`card_side_pageable`]).
+    staging: Option<ID3D12Resource>,
     /// The card side's bytes as they were when the submission's shaders
     /// started, in the card's memory too: made when shader writes are
     /// first declared for the copy, and compared with the card's side, on
@@ -2643,6 +2679,15 @@ impl Drop for Shadow {
         if self.kept.get_mut().unwrap_or_else(|e| e.into_inner()).1 {
             KEPT_BYTES.fetch_sub(self.len, Ordering::Relaxed);
         }
+        if self.own_side > 0 {
+            PAGEABLE[0].fetch_sub(1, Ordering::Relaxed);
+            PAGEABLE[1].fetch_sub(self.own_side, Ordering::Relaxed);
+            // SAFETY: `pageable_side`'s allocation; nothing reads the CPU
+            // side once the copy is gone.
+            unsafe {
+                windows_sys::Win32::System::Memory::VirtualFree(self.data.cast(), 0, windows_sys::Win32::System::Memory::MEM_RELEASE)
+            };
+        }
         let window = self.window;
         if self.mapped {
             WINDOW_MAPPED_BYTES.fetch_sub(self.len, Ordering::Relaxed);
@@ -3220,6 +3265,7 @@ impl Shadow {
             changes_only: Default::default(),
             mapped: false,
             place: None,
+            own_side: 0,
         }
     }
 
@@ -4392,6 +4438,12 @@ impl Shadow {
         self.card_changed_runs(std::iter::once((from, to)));
     }
 
+    /// (Merged runtime) Bytes of the CPU side that could not be sent up with
+    /// a submission go with the next one.
+    pub(crate) fn card_again(&self, from: usize, to: usize) {
+        self.card_changed(from, to);
+    }
+
     /// [`Shadow::card_changed`] of each of `runs`.
     fn card_changed_runs(&self, runs: impl Iterator<Item = (usize, usize)>) {
         let Some(card) = &self.card else {
@@ -4468,10 +4520,10 @@ impl Shadow {
 
     /// Of a copy in the card's memory: the CPU's side (PC memory), the
     /// card side's bytes from before if made yet, and their size.
-    pub(crate) fn card_sides(&self) -> Option<(&ID3D12Resource, Option<ID3D12Resource>, u64)> {
+    pub(crate) fn card_sides(&self) -> Option<(Option<&ID3D12Resource>, Option<ID3D12Resource>, u64)> {
         let card = self.card.as_ref()?;
         let before = card.before.lock().unwrap_or_else(|e| e.into_inner()).clone();
-        Some((&card.staging, before, card.size))
+        Some((card.staging.as_ref(), before, card.size))
     }
 
     /// Shader writes are declared for a copy in the card's memory: makes
@@ -4859,7 +4911,7 @@ mod land_tests {
         unsafe { std::ptr::write_bytes(data, 0, len) };
         let mut shadow = Shadow::new(buffer.clone(), data, 0, title as u64, len as u64);
         shadow.card = Some(Card {
-            staging: buffer,
+            staging: Some(buffer),
             before: Mutex::default(),
             dirty: Mutex::default(),
             sent: Mutex::default(),
@@ -5267,6 +5319,50 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
             entry.shadow = Some(Arc::new(Shadow::placed(placed, key.0, len, false)));
             return entry.shadow.clone();
         }
+        // (Merged runtime, `card_side_pageable`) A big one whose CPU side is
+        // the process's own memory: only the card's side is a host buffer.
+        if card_side_pageable()
+            && let Some(on_card) = card_for(size)
+        {
+            match pageable_side(size) {
+                Some(data) => {
+                    crate::host::name(&on_card, || format!("title buffer {:#x}+{len:#x} on the card", key.0));
+                    let n = PAGEABLE[0].fetch_add(1, Ordering::Relaxed) + 1;
+                    PAGEABLE[1].fetch_add(size, Ordering::Relaxed);
+                    if n <= 8 || n.is_power_of_two() {
+                        tracing::info!(
+                            start = format_args!("{:#x}", key.0),
+                            len,
+                            sides = n,
+                            mb = PAGEABLE[1].load(Ordering::Relaxed) >> 20,
+                            "a buffer's host copy is in the card's memory, its CPU side in the process's own (VICTORY_CARD_SIDE_PAGEABLE=1)"
+                        );
+                    }
+                    // SAFETY: a live buffer.
+                    let gpu = unsafe { on_card.GetGPUVirtualAddress() };
+                    let mut shadow = Shadow::new(on_card, data, gpu, key.0, len);
+                    shadow.own_side = size;
+                    shadow.card = Some(Card {
+                        staging: None,
+                        before: Mutex::default(),
+                        dirty: Mutex::default(),
+                        sent: Mutex::default(),
+                        touched: Default::default(),
+                        size,
+                    });
+                    let shadow = Arc::new(shadow);
+                    CARDED.lock().unwrap_or_else(|e| e.into_inner()).push(Arc::downgrade(&shadow));
+                    entry.shadow = Some(shadow);
+                    return entry.shadow.clone();
+                }
+                None => {
+                    // (No memory for the side: the card's side is let go and
+                    // the copy made as before.)
+                    CARD_BYTES[0].fetch_sub(size, Ordering::Relaxed);
+                    drop(on_card);
+                }
+            }
+        }
         let (buffer, data) = host()?.shared_buffer(size)?;
         crate::host::name(&buffer, || format!("title buffer {:#x}+{len:#x}", key.0));
         // A big one, with `cards`: shaders get a buffer in the card's own
@@ -5280,7 +5376,7 @@ fn lookup(address: u64, len: u64, any: bool) -> Option<Arc<Shadow>> {
                     "a buffer's host copy is in the card's memory"
                 );
                 let card = Card {
-                    staging: buffer,
+                    staging: Some(buffer),
                     before: Mutex::default(),
                     dirty: Mutex::default(),
                     sent: Mutex::default(),
@@ -5517,7 +5613,7 @@ pub(crate) fn by_address(start: u64, len: u64) -> Option<Arc<Shadow>> {
     shadow.window = true;
     shadow.changes_only.store(true, Ordering::Relaxed);
     shadow.card = Some(Card {
-        staging,
+        staging: Some(staging),
         before: Mutex::default(),
         dirty: Mutex::default(),
         sent: Mutex::default(),
@@ -5606,7 +5702,7 @@ fn loose(address: u64, end: u64, unsized_ask: bool, any: bool) -> Option<Arc<Sha
         Some(on_card) => {
             crate::host::name(&on_card, || format!("title memory {start:#x}+{len:#x} on the card"));
             let card = Card {
-                staging: buffer,
+                staging: Some(buffer),
                 before: Mutex::default(),
                 dirty: Mutex::default(),
                 sent: Mutex::default(),

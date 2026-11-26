@@ -2703,6 +2703,12 @@ fn frame_behind_wait() {
     relay_wait(WHY_SYNC, |_| FINISHED.load(Ordering::Acquire) >= before);
 }
 
+/// Whether what goes up to copies in the card's memory is taken into the
+/// submission's own memory ([`send`], `VICTORY_SEND_OWN`).
+pub(crate) fn sends_own() -> bool {
+    send::own()
+}
+
 /// The relay's second stage (`VICTORY_RELAY=2`): a submission that reads
 /// title memory a flight's shaders may write (a title buffer copy, a fill
 /// of upload memory, a texture) waits only until the flights that declared
@@ -4610,7 +4616,7 @@ impl Host {
                         let sides: Vec<_> = dirty.iter().map(|(shadow, _)| shadow.card_sides()).collect();
                         let mut ranges: Vec<upq::Range<'_>> = Vec::new();
                         for ((shadow, rs), side) in dirty.iter().zip(&sides) {
-                            if let Some((staging, _, _)) = side {
+                            if let Some((Some(staging), _, _)) = side {
                                 ranges.extend(rs.iter().map(|&(a, b)| (&shadow.buffer, a as u64, *staging, (b - a) as u64)));
                             }
                         }
@@ -4624,8 +4630,25 @@ impl Host {
                             continue;
                         };
                         if own.is_none() && up.is_none() {
-                            for &(a, b) in ranges {
-                                list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                            match staging {
+                                Some(staging) => {
+                                    for &(a, b) in ranges {
+                                        list.CopyBufferRegion(&shadow.buffer, a as u64, staging, a as u64, (b - a) as u64);
+                                    }
+                                }
+                                // (Merged runtime) A CPU side of our own is
+                                // no host buffer to copy from, and the
+                                // submission got no memory of its own for
+                                // the sends: they go with the next one.
+                                None => {
+                                    for &(a, b) in ranges {
+                                        shadow.card_again(a, b);
+                                    }
+                                    static SAID: std::sync::Once = std::sync::Once::new();
+                                    SAID.call_once(|| {
+                                        tracing::warn!("a submission got no memory of its own for what goes up to a copy whose CPU side is the process's own: sent with the next one")
+                                    });
+                                }
                             }
                         }
                         let bytes: u64 = ranges.iter().map(|&(a, b)| (b - a) as u64).sum();
