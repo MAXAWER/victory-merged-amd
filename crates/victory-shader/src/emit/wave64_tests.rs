@@ -273,6 +273,7 @@ fn on_64_lanes(native: &NativeProgram, p: &ir::Program) -> HostShader {
     let lowered = lowered.expect("lower");
     assert_eq!(lowered.wave_size, Some(64));
     let shader = HostShader {
+        half_views: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -1196,6 +1197,7 @@ fn partial_dispatch_with_a_cross_half_wave_op_runs_in_32_lane_waves() {
         .find(|u| u.root == RootType::Other(super::USER_DISPATCH_THREADS_X))
         .expect("USER_DISPATCH_THREADS_X");
     let shader = HostShader {
+        half_views: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

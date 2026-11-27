@@ -181,7 +181,7 @@ mod tests {
         assert_eq!(v.get("a").and_then(|a| a.at(2)).and_then(Value::text), Some("x\"yA"));
         assert_eq!(v.get("b").and_then(|b| b.get("c")), Some(&Value::Bool(true)));
         assert_eq!(v.get("e").map(Value::list).map(<[Value]>::len), Some(0));
-        assert_eq!(parse(b"[1, 2").is_none() && parse(b"{} x").is_none(), true);
+        assert!(parse(b"[1, 2").is_none() && parse(b"{} x").is_none());
         assert_eq!(parse(b"[1, 2.5]").unwrap().numbers(), Some(vec![1.0, 2.5]));
         assert_eq!(parse(b"[3]").unwrap().at(0).and_then(Value::index), Some(3));
     }

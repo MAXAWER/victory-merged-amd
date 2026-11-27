@@ -1846,6 +1846,7 @@ impl State {
                         }
                         continue;
                     };
+                    crate::vr::camera::seen(address, 0, if srv { 2 } else { 1 });
                     // The shader adds the bytes a raw view begins early by.
                     let biased = srv
                         && t.host.user_data.iter().any(|u| {
@@ -3782,6 +3783,8 @@ impl State {
                 let used = group.entry(k);
                 match crate::descriptor::view(table + u64::from(k) * 32) {
                     Some(View::Constant(address, size)) => {
+                        crate::vr::camera::first_person(address, size);
+                        crate::vr::camera::seen(address, size, 0);
                         // Renderer port 5: title memory in place is the
                         // card's to read where it is; nothing is copied.
                         if crate::port_cbv::in_place_on() {

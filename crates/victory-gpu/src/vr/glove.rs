@@ -234,7 +234,7 @@ mod tests {
         let mut data: Vec<u8> = Vec::new();
         let mut views = Vec::new();
         let mut push = |bytes: Vec<u8>, data: &mut Vec<u8>| {
-            while data.len() % 4 != 0 {
+            while !data.len().is_multiple_of(4) {
                 data.push(0);
             }
             views.push((data.len(), bytes.len()));

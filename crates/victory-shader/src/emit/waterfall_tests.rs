@@ -378,6 +378,7 @@ fn immediate_sampler_chosen_by_control_flow() {
             .map(|&w| super::StaticSampler::from_words(w))
             .collect();
         let shader = HostShader {
+            half_views: Vec::new(),
             stage: HwStage::Cs,
             dxil: lowered.dxil,
             user_data: lowered.user_data,

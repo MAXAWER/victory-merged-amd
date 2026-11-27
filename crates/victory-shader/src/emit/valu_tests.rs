@@ -177,6 +177,7 @@ fn build_cs(body: &[u32], threads: u32, lds_bytes: u32) -> HostShader {
     .expect("lower");
 
     let shader = HostShader {
+        half_views: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,
@@ -2083,6 +2084,7 @@ fn whole_wave_f64_sum_and_cvt_f32_f64() {
     .expect("lower");
 
     let shader = HostShader {
+        half_views: Vec::new(),
         stage: HwStage::Cs,
         dxil: lowered.dxil,
         user_data: lowered.user_data,

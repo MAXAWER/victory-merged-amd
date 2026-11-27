@@ -67,12 +67,15 @@ pub(crate) unsafe fn disarm_watchdog(base: usize, hash: &blake3::Hash) -> usize 
 
 /// Environment variable that pins the title's internal render scale
 /// (`0.2..=1.0` of the output size). Testing lever, off by default.
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 pub(crate) const RENDER_SCALE_ENV: &str = "VICTORY_RENDER_SCALE";
 /// Environment variable that makes the title use its own temporal upscaler
 /// on every console profile (Series S otherwise picks FSR).
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 pub(crate) const OWN_UPSCALER_ENV: &str = "VICTORY_OWN_UPSCALER";
 
 /// A patch whose bytes are computed at load time.
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 struct OwnedPatch {
     what: &'static str,
     rva: usize,
@@ -82,6 +85,7 @@ struct OwnedPatch {
 
 /// The upscaler choice: `mov eax, 6` (own upscaler) then `cmovne eax, ecx`
 /// (FSR when the profile asks for it). NOPing the cmovne keeps 6.
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 const OWN_UPSCALER: Patch<'static> = Patch {
     what: "upscaler: always the title's own",
     rva: 0x7e9426,
@@ -91,6 +95,7 @@ const OWN_UPSCALER: Patch<'static> = Patch {
 
 /// Read-only float constants of this build usable as the FSR scale:
 /// value, RVA.
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 const FSR_SCALES: [(f32, usize); 4] = [
     (0.5, 0x5fc6edc),
     (0.4, 0x5fc6f90),
@@ -105,6 +110,7 @@ const FSR_SCALES: [(f32, usize); 4] = [
 /// - FSR's scale (a load of 2/3 on Series S) pointed at a constant equal to
 ///   `scale`, when this build has one, and its maximum size made the scaled
 ///   size (vtable slot 11 → slot 10's function).
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
     let mut patches = vec![
         OwnedPatch {
@@ -152,6 +158,7 @@ fn render_scale_patches(base: usize, scale: f32, fsr: bool) -> Vec<OwnedPatch> {
 }
 
 /// The scale `VICTORY_RENDER_SCALE` asks for, if valid.
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 fn parse_scale(text: &str) -> Option<f32> {
     let v: f32 = text.trim().parse().ok()?;
     (0.2..=1.0).contains(&v).then_some(v)
@@ -162,6 +169,7 @@ fn parse_scale(text: &str) -> Option<f32> {
 ///
 /// # Safety
 /// As `disarm_watchdog`.
+#[allow(dead_code)] // the base's render-scale lever: not wired in this tree
 pub(crate) unsafe fn resolution_levers(base: usize, hash: &blake3::Hash) -> usize {
     let scale = std::env::var(RENDER_SCALE_ENV).ok();
     let own = std::env::var_os(OWN_UPSCALER_ENV).is_some_and(|v| v != "0");

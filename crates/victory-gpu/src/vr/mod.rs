@@ -49,6 +49,7 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 
 use crate::host::{Host, transition};
 
+pub(crate) mod camera;
 mod emu;
 mod glove;
 mod hands;
@@ -550,6 +551,7 @@ fn open() -> Result<Api, String> {
         unsafe { GetProcAddress(module, name.as_ptr().cast()) }.ok_or_else(|| format!("the runtime's library has no {}", name.to_string_lossy()))
     };
     // SAFETY: the library's exports, with the types `openvr_capi.h` gives them.
+    #[allow(clippy::missing_transmute_annotations)]
     let (init, interface, text): (InitInternal, GetGenericInterface, ErrorText) = unsafe {
         (
             std::mem::transmute::<_, InitInternal>(export(c"VR_InitInternal2")?),

@@ -50,8 +50,8 @@ if ($VREmu) {
     if (Get-Process vrserver, vrmonitor, vrcompositor -ErrorAction SilentlyContinue) { Write-Host 'Closing the running SteamVR to start the stand-in headset.'; Stop-SteamVR }
     $emu = "$env:LOCALAPPDATA\victory\vr-emu"
     New-Item -ItemType Directory -Force -Path "$emu\logs" | Out-Null
-    Copy-Item (Join-Path $PSScriptRoot 'vr-emu\steamvr.vrsettings') "$emu\steamvr.vrsettings" -Force
-    Copy-Item (Join-Path $PSScriptRoot 'vr-emu\chaperone_info.vrchap') "$emu\chaperone_info.vrchap" -Force
+    Copy-Item (Join-Path $PSScriptRoot 'vr-emu\steamvr.vrsettings.json') "$emu\steamvr.vrsettings" -Force
+    Copy-Item (Join-Path $PSScriptRoot 'vr-emu\chaperone_info.vrchap.json') "$emu\chaperone_info.vrchap" -Force
     $settings['VICTORY_VR_EMU'] = '1'; $settings['VR_CONFIG_PATH'] = $emu; $settings['VR_LOG_PATH'] = "$emu\logs"
 }
 foreach ($k in $More.Keys) { $settings[$k] = [string]$More[$k] }

@@ -1305,6 +1305,7 @@ mod host {
     /// 0.2 s that long after input starts, with or without focus. A key is
     /// named as [`vk_named`] takes it (the stand-in pad's table maps them to
     /// buttons). Keys from `VICTORY_KEYS_FILE` ([`file_keys`]) join them.
+    #[allow(dead_code)] // a debugging aid: not every build reads it
     fn scripted() -> Vec<u8> {
         static SCRIPT: LazyLock<(Instant, Vec<(Duration, u8)>)> = LazyLock::new(|| {
             let list = std::env::var("VICTORY_KEYS").unwrap_or_default();
@@ -1327,6 +1328,7 @@ mod host {
 
     /// A key's virtual-key code from its name: a letter, a digit, or `Enter`,
     /// `Space`, `Esc`, `Tab`, `Back`, `Up`, `Down`, `Left`, `Right`.
+    #[allow(dead_code)]
     fn vk_named(name: &str) -> Option<u8> {
         Some(match name.trim() {
             "Enter" => 0x0D,
@@ -1350,6 +1352,7 @@ mod host {
     /// the title a key at a time, looking at the window between keys. Lines
     /// already in the file when input starts are skipped; the file is looked
     /// at every 30 ms at most, and only whole lines are taken.
+    #[allow(dead_code)]
     fn file_keys() -> Vec<u8> {
         struct Feed {
             path: std::path::PathBuf,
