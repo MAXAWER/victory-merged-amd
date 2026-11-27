@@ -46,6 +46,16 @@ $s = [ordered]@{
     # frame wait for the card four times a frame (22-30 ms of 57); 20 -> 23 fps in the first
     # playable scene.
     VICTORY_PORT_CBV_WRITTEN   = '2'
+    # Title buffers of 1 MiB and more have their copy in the card's memory (the default on a
+    # 16 GB card is 4 MiB): shaders read and write them there, not over the bus, and the card
+    # finds what they wrote (96 MB snapshotted and 119 MB compared on the CPU a frame became 24
+    # and 26). Median frame of the run 53 -> 43 ms, the picture as clean. From 256 KiB on a
+    # shore flickers; from 64 KiB a loading screen stood 30 s.
+    VICTORY_CARD_BUFFERS_MIN_MB = '1'
+    # The base's fix for palms and trees dropping out (indirect draws whose arguments the card
+    # reads in place are clamped alone, right before they run) is on by default there. On the
+    # RX 9070 XT the card then works 78 ms a frame instead of 32. Off here.
+    VICTORY_PORT_CONSTANTS_ORDER = '0'
 }
 if ($Fps30) { $s.Remove('VICTORY_FRAME_INTERVAL_MS') }
 

@@ -59,14 +59,14 @@ from one save: the opening cutscenes into the first playable scene.
 
 | What | Result |
 | --- | --- |
-| Whole run | median 53 ms a frame (18.8 fps); 90 % of frames under 92 ms |
+| Whole run | median 43 ms a frame (23.0 fps); 90 % of frames under 68 ms |
 | Menus and loading screens | up to 60 fps |
-| Cutscene close-ups (1,400-1,600 draws) | 24-26 fps |
-| First playable scene (about 3,900 draws) | 22-23 fps |
-| The same scene looking at a shore with trees (about 6,200-6,700 draws) | 19 fps |
-| Heaviest cutscene shots (4,500-6,000 draws) | 10-18 fps |
-| Memory | about 30 GB private (22 GB working set), 12 GB of video memory |
-| Picture | no flicker in the measured scenes: 47 tile flashes over a 7-minute recording (160-200 before), two pictures going back (13-28 before), no trees coming and going (a third to a half of all picture changes before) |
+| Cutscene close-ups (1,400-1,600 draws) | 27 fps |
+| First playable scene (about 3,900 draws) | 26 fps |
+| The same scene looking at a shore with trees (about 6,200-6,700 draws) | 21.5-22 fps |
+| Heaviest cutscene shots (4,500-6,000 draws) | about 20 fps, single frames far longer |
+| Memory | about 29 GB private (16-17 GB working set), 12 GB of video memory |
+| Picture | no flicker in the measured scenes: 47 tile flashes over a 7-minute recording (160-200 before), three pictures going back (13-28 before), no trees coming and going (a third to a half of all picture changes before) |
 | Previous base of this repo, same save and PC | median 76 ms (13 fps) |
 
 These are the settings with a clean picture. The fast settings of the base (presents sent ahead, steps done on the card) gave 21-23 fps over the same run with flickering light, black patches and trees that came and went; PORTING.md has the comparison.
@@ -75,7 +75,8 @@ Every run is recorded at 60 frames a second and looked through by a script for f
 
 ## Known problems
 
-- Not yet 30 fps: 19-23 fps in the playable scenes with the clean settings. The frame is CPU-bound: recording the title's draw calls (about 22 ms on each of its five threads) and preparing the submissions (about 25 ms).
+- Not yet 30 fps: 22-26 fps in the playable scenes with the clean settings. At a shore with 6,500 draws the thread that submits prepares the frame's 37 submissions for about 24 ms and the card works 32 ms (its own timestamps); the two overlap badly: the card idles about 12 ms a frame while submissions are prepared, and the present waits about 8 ms for it at the end.
+- Palms and trees can drop out in some cutscene shots. The base's fix for it (`VICTORY_PORT_CONSTANTS_ORDER=1`) is merged but off by default here: on the RX 9070 XT it makes the card work 78 ms a frame instead of 32 (91 ms a frame at the shore against 46).
 - Hitches of 0.2-0.9 s when a scene loads on a PC with 32 GB of RAM: the process holds 22-24 GB of it and Windows pages (the work on memory is described in PORTING.md).
 - Two pipelines are left out because the AMD shader compiler crashes on them.
 - 29 pipelines that the title creates through two unimplemented device methods are not drawn.

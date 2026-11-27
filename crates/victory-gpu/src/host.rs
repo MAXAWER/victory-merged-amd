@@ -2482,6 +2482,52 @@ impl Drop for Deferred {
     }
 }
 
+/// (Local) Read-back buffers that are done with, by their size, for the next
+/// read back of that size (`VICTORY_BACK_POOL=0`: each is made and released,
+/// as before).
+///
+/// Why: every read back made its own committed buffer and released it at its
+/// list's reset. The title reads back about fourteen textures a frame (32 to
+/// 512 KiB each) besides its two small float targets, and on the RX 9070 XT
+/// the creation waits for the kernel: in a sampling profile of 2026-11-27 (a
+/// shore, 6,200 draws) 11.7 % of the samples of threads recording lists stood
+/// in `read_back_buffer`, in `NtGdiDdDDIWaitForSynchronizationObjectFromCpu`.
+///
+/// A buffer comes back when its list is reset: after the list's last
+/// submission has finished and its read-backs have landed, so nobody reads
+/// or writes it any more. Sizes are rounded up to 64 KiB, and at most
+/// [`SPARE_BACKS_MOST`] bytes are kept.
+static SPARE_BACKS: std::sync::Mutex<Vec<(u64, SpareBack)>> = std::sync::Mutex::new(Vec::new());
+struct SpareBack(ID3D12Resource);
+// SAFETY: D3D12 objects are free-threaded.
+unsafe impl Send for SpareBack {}
+const SPARE_BACK_GRAIN: u64 = 64 << 10;
+const SPARE_BACKS_MOST: u64 = 96 << 20;
+/// Read-back buffers made, used again, and not kept when done with.
+static SPARE_BACK_STATS: [std::sync::atomic::AtomicU64; 3] = [const { std::sync::atomic::AtomicU64::new(0) }; 3];
+
+fn spare_backs_on() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_BACK_POOL").is_none_or(|v| v != "0"))
+}
+
+/// (Local) A read-back buffer nobody reads or writes any more: kept for the
+/// next read back of its size ([`SPARE_BACKS`]).
+pub(crate) fn read_back_done(buffer: ID3D12Resource) {
+    if !spare_backs_on() {
+        return;
+    }
+    // SAFETY: a live buffer of ours.
+    let bytes = unsafe { buffer.GetDesc() }.Width;
+    let mut spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+    let kept: u64 = spare.iter().map(|(b, _)| *b).sum();
+    if bytes % SPARE_BACK_GRAIN != 0 || kept + bytes > SPARE_BACKS_MOST {
+        SPARE_BACK_STATS[2].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        return;
+    }
+    spare.push((bytes, SpareBack(buffer)));
+}
+
 /// (Local) What a list kept until its reset is let go of by a thread of ours
 /// (`VICTORY_DROP_ASIDE=0`: by whoever resets the list, as before). A list is
 /// reset by the thread that submits, between its submissions, or by a thread
@@ -2489,7 +2535,14 @@ impl Drop for Deferred {
 /// resource), its steps' closures and references took 3 to 14 ms of a frame's
 /// chain there (timeline runs am8_tl and am9_tl, 3,900 draws). Nothing waits
 /// for these objects to be gone: they are only held a little longer.
-fn let_go(kept: Deferred) {
+fn let_go(mut kept: Deferred) {
+    // (Local) Its read-back buffers are used again ([`read_back_done`]).
+    for (buffer, ..) in kept.backs.drain(..) {
+        read_back_done(buffer);
+    }
+    for back in kept.texture_backs.drain(..) {
+        read_back_done(back.into_buffer());
+    }
     struct Gone(#[allow(dead_code)] Deferred);
     // SAFETY: D3D12 objects are free-threaded, and nobody else holds what a
     // list kept once it is taken out of the list.
@@ -3930,6 +3983,7 @@ fn late_line(frames: f64) {
     crate::port_cbv::log(frames);
     crate::watch::port_guard_line(frames);
     crate::port_journal::line(frames);
+    crate::port_rt::line(frames);
     crate::picked::log(frames);
     #[cfg(feature = "diagnostics")]
     log_blame(frames);
@@ -3975,6 +4029,10 @@ mod torn;
 #[cfg(feature = "diagnostics")]
 mod traffic;
 pub(crate) mod upcheck;
+#[cfg(feature = "diagnostics")]
+pub(crate) mod rtstamps;
+#[cfg(test)]
+mod rtbench;
 #[cfg(feature = "diagnostics")]
 mod stamps;
 #[cfg(feature = "diagnostics")]
@@ -7274,9 +7332,38 @@ impl HostList {
     /// Copies `len` bytes of title memory at `src` into the list's upload
     /// memory at `dst` when the list is submitted.
     pub(crate) fn defer_fill(&self, dst: *mut u8, src: *const u8, len: usize) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, None));
+            .push(Step::Fill(dst as usize, src, len, None));
+    }
+
+    /// Renderer port RT: where a fill of `[src, src + len)` recorded now
+    /// takes its bytes. If the last step of this list that writes them is a
+    /// copy at its place ([`place`]) that holds all of them and copies what
+    /// the CPU takes out of its source at submission, and no step since
+    /// writes the source or declares a shader write over either, the fill
+    /// takes them out of that source: the same bytes the card has there when
+    /// the list reads them (`crate::port_rt`). Else `src`.
+    fn forward_fill(&self, src: usize, len: usize) -> usize {
+        if !crate::port_rt::on() || len == 0 {
+            return src;
+        }
+        let deferred = self.deferred();
+        let seen = deferred.copies.iter().rev().map(|step| match step {
+            Step::Placed(p) => crate::port_rt::Seen::Placed { dst: p.dst, src: p.src, len: p.len, from_upload: p.from_upload() },
+            &Step::Copy(d, _, n) => crate::port_rt::Seen::Writes(d, d + n),
+            &Step::GpuWrite(_, a, n) => crate::port_rt::Seen::Writes(a, a + n),
+            Step::Run(_) => crate::port_rt::Seen::Anything,
+            _ => crate::port_rt::Seen::Nothing,
+        });
+        match crate::port_rt::forwarded(seen, src, len) {
+            Some(from) => {
+                crate::port_rt::count(crate::port_rt::FORWARDED);
+                from
+            }
+            None => src,
+        }
     }
 
     /// The host address of `len` bytes of scratch memory that hold the title
@@ -7297,16 +7384,18 @@ impl HostList {
     /// As [`HostList::defer_fill`], for upload memory that only `slot` (a
     /// title heap's address, and the slot) shows.
     pub(crate) fn defer_constants(&self, dst: *mut u8, src: *const u8, len: usize, slot: (usize, u32)) {
+        let src = self.forward_fill(src as usize, len);
         self.deferred()
             .copies
-            .push(Step::Fill(dst as usize, src as usize, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
+            .push(Step::Fill(dst as usize, src, len, Some(card_steps::FillTo::Slot(slot.0, slot.1))));
     }
 
     /// As [`HostList::defer_fill`], for the beginning of a buffer
     /// [`HostList::upload`] made.
     pub(crate) fn defer_fill_buffer(&self, buffer: &ID3D12Resource, dst: *mut u8, src: *const u8, len: usize) {
         let to = (card_steps::stage() > 1).then(|| card_steps::FillTo::Buffer(buffer.clone()));
-        self.deferred().copies.push(Step::Fill(dst as usize, src as usize, len, to));
+        let src = self.forward_fill(src as usize, len);
+        self.deferred().copies.push(Step::Fill(dst as usize, src, len, to));
     }
 
     /// Brings `[address, address + len)` of a buffer's host copy up to date
@@ -9191,14 +9280,36 @@ impl Host {
     /// A buffer in the upload heap, mapped for writing.
     /// A buffer of `size` bytes the card writes and we read (a read back),
     /// in the state copies into it need.
+    ///
+    /// (Local) One that is done with is used again: see [`SPARE_BACKS`].
     pub(crate) fn read_back_buffer(&self, size: u64) -> Option<ID3D12Resource> {
+        use std::sync::atomic::Ordering::Relaxed;
+        let size = if spare_backs_on() { size.max(1).next_multiple_of(SPARE_BACK_GRAIN) } else { size.max(1) };
+        if spare_backs_on() {
+            let mut spare = SPARE_BACKS.lock().unwrap_or_else(|e| e.into_inner());
+            if let Some(i) = spare.iter().position(|(bytes, _)| *bytes == size) {
+                let (_, SpareBack(buffer)) = spare.swap_remove(i);
+                drop(spare);
+                SPARE_BACK_STATS[1].fetch_add(1, Relaxed);
+                return Some(buffer);
+            }
+        }
+        let made_so_far = SPARE_BACK_STATS[0].fetch_add(1, Relaxed) + 1;
+        if made_so_far.is_power_of_two() && made_so_far >= 64 {
+            tracing::info!(
+                made = made_so_far,
+                used_again = SPARE_BACK_STATS[1].load(Relaxed),
+                not_kept = SPARE_BACK_STATS[2].load(Relaxed),
+                "read-back buffers so far"
+            );
+        }
         let heap = D3D12_HEAP_PROPERTIES {
             Type: D3D12_HEAP_TYPE_READBACK,
             ..Default::default()
         };
         let desc = D3D12_RESOURCE_DESC {
             Dimension: D3D12_RESOURCE_DIMENSION_BUFFER,
-            Width: size.max(1),
+            Width: size,
             Height: 1,
             DepthOrArraySize: 1,
             MipLevels: 1,

@@ -138,6 +138,12 @@ impl Back {
     pub(crate) fn range(&self) -> (usize, usize) {
         (self.ticket.at, self.ticket.end)
     }
+
+    /// (Local) Its read-back buffer, to be used again once the list that
+    /// wrote it is reset (`crate::host::read_back_done`).
+    pub(crate) fn into_buffer(self) -> ID3D12Resource {
+        self.buffer
+    }
 }
 
 /// Records a host copy from a texture already in COPY_SOURCE.
