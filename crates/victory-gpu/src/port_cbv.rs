@@ -48,8 +48,61 @@ pub(crate) fn in_place_on() -> bool {
 
 /// Since the last line: tables' constant buffers given in place, their bytes;
 /// copied as before because not in place, because not on 16 bytes; title
-/// slots' constant buffers whose twin is a raw view.
-static STATS: [AtomicU64; 5] = [const { AtomicU64::new(0) }; 5];
+/// slots' constant buffers whose twin is a raw view; those read in the host
+/// copy of a buffer shaders write ([`written_on`]), and those of such buffers
+/// copied all the same (not on 16 bytes of the copy).
+static STATS: [AtomicU64; 7] = [const { AtomicU64::new(0) }; 7];
+
+/// (Local) Whether a table's constant buffer that lies in a title buffer
+/// shaders write (declared so at least once) is read by the card in that
+/// buffer's host copy (`VICTORY_PORT_CBV_WRITTEN=1`; off by default), not
+/// copied out of title memory on the CPU when the submission is prepared.
+///
+/// Why: the copy on the CPU has to see what the flights in the air write
+/// there, so the submission stood until they had landed: about four such
+/// waits a frame, 22 to 30 ms of a 57 ms frame in the first playable scene
+/// (five buffers of 0x190 to 0x340 bytes, each read ten to twenty times a
+/// frame as constants). The steps done on the card (`VICTORY_CARD_STEPS`)
+/// take those waits away with a copy of the bytes on the card in front of
+/// the submission's lists, and with them trees on a shore came and went from
+/// frame to frame (recordings of 2026-11-27).
+///
+/// Here nothing is copied at all: the constant buffer's raw view is a view
+/// of the host copy the shaders write, at the constant's place, so the draw
+/// reads what is there when it runs, behind every write submitted before it
+/// and in front of every later one, as on the console. What the title's CPU
+/// wrote there goes up with a refresh at submission, as for any buffer view
+/// a draw reads. Needs renderer port 5 (constants read as raw bytes).
+///
+/// What it assumes: the shaders that write the constants write this host
+/// copy (a view of the same title buffer), not another copy of the same
+/// memory.
+pub(crate) fn written_on() -> bool {
+    on() && written_level() > 0
+}
+
+/// `VICTORY_PORT_CBV_WRITTEN`: 0 (unset) off; 1 with a refresh of the
+/// constant's bytes from title memory at submission; 2 without one.
+pub(crate) fn written_level() -> u8 {
+    static LEVEL: std::sync::OnceLock<u8> = std::sync::OnceLock::new();
+    *LEVEL.get_or_init(|| match std::env::var("VICTORY_PORT_CBV_WRITTEN").ok().as_deref() {
+        Some("1") => 1,
+        Some("2") => 2,
+        _ => 0,
+    })
+}
+
+/// A table's constant buffer of `size` bytes is read in the host copy of a
+/// buffer shaders write.
+pub(crate) fn from_written(size: u32) {
+    let _ = size;
+    STATS[5].fetch_add(1, Relaxed);
+}
+
+/// One of a buffer shaders write was copied all the same.
+pub(crate) fn not_from_written() {
+    STATS[6].fetch_add(1, Relaxed);
+}
 
 /// A table's constant buffer of `size` bytes was given in place.
 pub(crate) fn in_place(size: u32) {
@@ -82,12 +135,14 @@ pub(crate) fn log(frames: f64) {
     let s: Vec<f64> = STATS.iter().map(|s| s.swap(0, Relaxed) as f64 / frames.max(1e-9)).collect();
     tracing::info!(
         "renderer port 5 (VICTORY_PORT_CBV=1) per frame: {:.0} tables' constant buffers read by the card in place ({:.1} KB not copied, \
-         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin",
+         no step at submission); copied as before: {:.0} not in place, {:.0} not on 16 bytes; {:.0} title slots' constant buffers with a raw twin;          {:.0} read in the host copy of a buffer shaders write (VICTORY_PORT_CBV_WRITTEN), {:.0} of such buffers copied all the same",
         s[0],
         s[1] / 1024.0,
         s[2],
         s[3],
         s[4],
+        s[5],
+        s[6],
     );
 }
 

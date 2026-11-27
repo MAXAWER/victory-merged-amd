@@ -41,6 +41,11 @@ $s = [ordered]@{
     # Without the ray-tracing structure builder the title's rays find nothing, every frame alike;
     # part of the shader translation.
     VICTORY_RAYS_MISS          = '1'
+    # Constants in small buffers the title's shaders fill are read by the card in the buffer's host
+    # copy when the draw runs, with no refresh from title memory. Copied on the CPU they made the
+    # frame wait for the card four times a frame (22-30 ms of 57); 20 -> 23 fps in the first
+    # playable scene.
+    VICTORY_PORT_CBV_WRITTEN   = '2'
 }
 if ($Fps30) { $s.Remove('VICTORY_FRAME_INTERVAL_MS') }
 

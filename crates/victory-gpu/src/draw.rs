@@ -247,6 +247,14 @@ const BAKE_PIXEL_SHADERS: [&str; 4] =
 /// made for a bake draw.
 pub(crate) static EARLY_TEXTURE_PASSES: [AtomicU64; 2] = [AtomicU64::new(0), AtomicU64::new(0)];
 
+/// (Local, `crate::port_cbv::written_on`) Title buffers up to this size that
+/// shaders write are the ones whose constants the card reads in their host
+/// copy: the buffers seen are 0x190 to 0x340 bytes, each all one constant
+/// buffer the title's shaders fill. Constants the title's CPU writes into
+/// larger buffers stay copies taken when their submission is prepared (a
+/// host copy in the PC's memory is rewritten under submissions in the air).
+const SMALL_WRITTEN: u64 = 64 << 10;
+
 /// Whether a buffer range a shader names through an unordered access view
 /// is given to shaders as written (snapshot before the submission, compare
 /// and write back after) only if that shader's code can store to buffers.
@@ -3696,6 +3704,31 @@ impl State {
                                 }
                                 None => crate::port_cbv::copied(true),
                             }
+                        }
+                        // (Local) A constant buffer in a small title buffer that
+                        // shaders write: the card reads it in that buffer's
+                        // host copy, where they wrote it, when the draw runs
+                        // (`crate::port_cbv::written_on`).
+                        if crate::port_cbv::written_on()
+                            && let Some(shadow) =
+                                crate::shadow::find(address, u64::from(size)).filter(|s| !s.in_place() && s.written() && s.span().1 <= SMALL_WRITTEN)
+                        {
+                            if host.constant_raw_at(index, &shadow.buffer, shadow.gpu(address), size) {
+                                // (At 1 the title's bytes are brought into
+                                // the copy first, as for any view a draw
+                                // reads; at 2 they are not: the copy has one
+                                // side, the shaders that fill the buffer
+                                // wrote it on the card already, and title
+                                // memory holds what landed a frame ago.)
+                                if crate::port_cbv::written_level() < 2 {
+                                    shadow.refresh(list, address, u64::from(size));
+                                } else {
+                                    list.keep(&shadow.buffer);
+                                }
+                                crate::port_cbv::from_written(size);
+                                continue;
+                            }
+                            crate::port_cbv::not_from_written();
                         }
                         let Some((buffer, gpu, to)) = list.scratch_held(u64::from(size)) else {
                             host.make_null(index);

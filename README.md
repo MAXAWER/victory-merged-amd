@@ -59,14 +59,14 @@ from one save: the opening cutscenes into the first playable scene.
 
 | What | Result |
 | --- | --- |
-| Whole run | median 57 ms a frame (17.5 fps); 90 % of frames under 80 ms |
+| Whole run | median 53 ms a frame (18.8 fps); 90 % of frames under 92 ms |
 | Menus and loading screens | up to 60 fps |
-| Cutscene close-ups (1,400-1,600 draws) | 20-23 fps |
-| First playable scene (about 3,900 draws) | 19-20 fps |
-| The same scene looking at a shore with trees (about 6,200 draws) | 17-18 fps |
-| Heaviest cutscene shots (4,200-5,400 draws) | 15-17 fps |
-| Memory | about 29 GB private (21 GB working set), 12 GB of video memory |
-| Picture | no flicker in the measured scenes: 47 tile flashes over a 7-minute recording (160-200 before), one picture going back (13-28 before), no trees coming and going (a third to a half of all picture changes before) |
+| Cutscene close-ups (1,400-1,600 draws) | 24-26 fps |
+| First playable scene (about 3,900 draws) | 22-23 fps |
+| The same scene looking at a shore with trees (about 6,200-6,700 draws) | 19 fps |
+| Heaviest cutscene shots (4,500-6,000 draws) | 10-18 fps |
+| Memory | about 30 GB private (22 GB working set), 12 GB of video memory |
+| Picture | no flicker in the measured scenes: 47 tile flashes over a 7-minute recording (160-200 before), two pictures going back (13-28 before), no trees coming and going (a third to a half of all picture changes before) |
 | Previous base of this repo, same save and PC | median 76 ms (13 fps) |
 
 These are the settings with a clean picture. The fast settings of the base (presents sent ahead, steps done on the card) gave 21-23 fps over the same run with flickering light, black patches and trees that came and went; PORTING.md has the comparison.
@@ -75,7 +75,7 @@ Every run is recorded at 60 frames a second and looked through by a script for f
 
 ## Known problems
 
-- Not yet 30 fps: 17-20 fps in heavy scenes with the clean settings; the frame is CPU-bound.
+- Not yet 30 fps: 19-23 fps in the playable scenes with the clean settings. The frame is CPU-bound: recording the title's draw calls (about 22 ms on each of its five threads) and preparing the submissions (about 25 ms).
 - Hitches of 0.2-0.9 s when a scene loads on a PC with 32 GB of RAM: the process holds 22-24 GB of it and Windows pages (the work on memory is described in PORTING.md).
 - Two pipelines are left out because the AMD shader compiler crashes on them.
 - 29 pipelines that the title creates through two unimplemented device methods are not drawn.
@@ -89,7 +89,7 @@ Every run is recorded at 60 frames a second and looked through by a script for f
   - [vitutu1/victory-perf](https://github.com/vitutu1/victory-perf): the loader hook that takes out the title's watchdog.
   - [fxceless/victory-fork](https://github.com/fxceless/victory-fork) PR #927 by tippythetaidum: 16-bit buffer channels through unsigned twin views (faces).
   - [Belobug/VIctory-Belobug-AMD](https://github.com/Belobug/VIctory-Belobug-AMD) branch `rx9070xt`: RX 9070 XT and 16 GB fixes, texture uploads in the submission prelude, PC FidelityFX 4.1.2 to 4K.
-  - Own work: the fix for flickering light and black patches (a present waits for its own frame), the cause of trees flickering on shores (steps done on the card, now off), mouse look, a rays-miss mode for runs without ray tracing, objects of a command list released on a thread of their own, scripted keys for automated runs, warm refusals, the RX 9070 XT findings (clean-up pass 4, Series X with the 4K mode for a right-sized interface), per-part timing of list reset/close.
+  - Own work: the fix for flickering light and black patches (a present waits for its own frame), the cause of trees flickering on shores (steps done on the card, now off), mouse look, a rays-miss mode for runs without ray tracing, objects of a command list released on a thread of their own, scripted keys for automated runs, warm refusals, the RX 9070 XT findings (clean-up pass 4, Series X with the 4K mode for a right-sized interface), per-part timing of list reset/close, constants of small shader-filled buffers read on the card instead of waiting for it (four waits a frame gone).
 
 The history of the previous KLBF-based tree and all measurements are in
 [PORTING.md](PORTING.md) (Russian).

@@ -920,9 +920,34 @@ pub(super) fn present(
     STATS[PRESENTS].fetch_add(1, Relaxed);
     LANE.push(this as usize, [Job::Present(texture, overlay, shown)]);
     let began = Instant::now();
-    let _waiting = crate::timeline::span("a present waits for the one before it to be sent");
+    let mut waiting = crate::timeline::span("a present waits for the one before it to be sent");
     LANE.wait_presents(frames_most());
+    if present_landed() {
+        // (Local) This present is sent too, and what went to the card before
+        // it has landed: the title goes on from a frame that is done.
+        waiting.next("a present waits for its own frame to be sent and to land");
+        LANE.wait_presents(0);
+        crate::host::settle_for_present();
+    }
+    waiting.end();
     STATS[AT_PRESENT].fetch_add(began.elapsed().as_micros() as u64, Relaxed);
+}
+
+/// (Local) Whether the title's present call returns only when the frame it
+/// shows has been sent and everything sent before it has landed
+/// (`VICTORY_PRESENT_LANDED=1`; off by default).
+///
+/// The line needs presents sent ahead (stage 3 of the late waits), and with
+/// those the title went on to its next frame before the card had run this
+/// one: in recordings of 2026-11-27 (RX 9070 XT) light and shadow on
+/// characters then alternated with every frame, black patches came and went,
+/// and huge dark polygons flashed for single frames; `VICTORY_LATE_WAIT=2`,
+/// where a present settles the flights, has none of it, but has no line. This
+/// is that guarantee for the line: recording and preparing still run beside
+/// the title, and only the end of the frame is where it stands.
+fn present_landed() -> bool {
+    static ON: OnceLock<bool> = OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_PRESENT_LANDED").is_some_and(|v| v == "1"))
 }
 
 /// For the frame-rate line.
