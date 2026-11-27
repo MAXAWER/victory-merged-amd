@@ -7,11 +7,19 @@
 //!   depth buffer. Three ways to see it (`VICTORY_VR_MODE`, F6 goes to the
 //!   next while playing): `3d`, the frame as a relief around the player, as
 //!   if standing where the title's camera stands, `cinema`, a flat screen in
-//!   the room, and `immersive`, a wide flat screen fixed to the head with
-//!   the head's turning given to the title's camera stick. F7 centres the
-//!   view where the head looks; F8 and F9 make the relief smaller and larger.
-//! - **Hands** ([`hands`]): flat pieces that follow the controllers and bend
-//!   with grip and trigger.
+//!   the room, and `immersive`, the relief fixed to the head with the head's
+//!   turning given to the title's camera stick. F7 centres the view where
+//!   the head looks; F8 and F9 show the frame smaller and larger (with Ctrl:
+//!   the whole nearer and further off).
+//! - **What the player holds** ([`glove`], [`hands`], [`scene`]): at each
+//!   controller the player's hand, SteamVR's own hand model with its fingers
+//!   bent by grip and trigger, or the controller as SteamVR draws it; F10
+//!   goes from one to the other (by default the controllers while watching,
+//!   the hands where the head turns the camera, and a closing hand is always
+//!   a hand).
+//! - **What the player wears** ([`track`], [`body`]): the trackers on the
+//!   body (waist, feet, knees, elbows...), by the role SteamVR gives each,
+//!   shown as markers and given out for whoever moves a body with them.
 //! - **The controllers as the title's pad** ([`track`]): sticks, triggers
 //!   and buttons, and a fist thrown forward presses the title's strike
 //!   button.
@@ -23,14 +31,14 @@
 //! through `%LOCALAPPDATA%\openvr\openvrpaths.vrpath`, or
 //! `VICTORY_VR_RUNTIME=<the runtime's folder>`), loaded from its own folder,
 //! as a scene application. The interfaces are the C function tables of
-//! `IVROverlay_028`, `IVRSystem_026` and `IVRCompositor_029`
+//! `IVRSystem_026`, `IVRCompositor_029` and `IVRRenderModels_006`
 //! (ValveSoftware/openvr, `headers/openvr_capi.h`, BSD-3-Clause): the
 //! indices here are those tables'.
 //!
 //! The frame for the headset is taken where the title's frame goes to the
 //! window ([`frame`], [`show`]): the back buffer and the depth buffer the
-//! frame drew the most with ([`depth_bound`]) are copied into one of three
-//! snapshots of ours, and the copy is fenced on the title's queue.
+//! title draws its frames with ([`depth_bound`]) are copied into one of
+//! three snapshots of ours, and the copy is fenced on the title's queue.
 
 use std::ffi::{CStr, c_char, c_void};
 use std::sync::atomic::{AtomicBool, AtomicU8, AtomicU32, AtomicUsize, Ordering::Relaxed};
@@ -42,33 +50,18 @@ use windows::Win32::Graphics::Dxgi::Common::*;
 use crate::host::{Host, transition};
 
 mod emu;
+mod glove;
 mod hands;
+mod json;
 mod math;
 mod scene;
 mod track;
 
 use math::M34;
 
-const OVERLAY_INTERFACE: &CStr = c"FnTable:IVROverlay_028";
 const SYSTEM_INTERFACE: &CStr = c"FnTable:IVRSystem_026";
 const COMPOSITOR_INTERFACE: &CStr = c"FnTable:IVRCompositor_029";
-
-/// `IVROverlay_028`'s function table: the places of the functions used.
-mod overlay {
-    pub(super) const FIND: usize = 0;
-    pub(super) const CREATE: usize = 1;
-    pub(super) const SET_FLAG: usize = 11;
-    pub(super) const SET_COLOR: usize = 14;
-    pub(super) const SET_SORT_ORDER: usize = 20;
-    pub(super) const SET_WIDTH: usize = 22;
-    pub(super) const SET_TRANSFORM_ABSOLUTE: usize = 33;
-    pub(super) const SET_TRANSFORM_RELATIVE: usize = 35;
-    pub(super) const SHOW: usize = 43;
-    pub(super) const HIDE: usize = 44;
-    pub(super) const SET_RAW: usize = 62;
-    /// How many entries the table has: nothing past it is read.
-    pub(super) const ENTRIES: usize = 82;
-}
+const MODELS_INTERFACE: &CStr = c"FnTable:IVRRenderModels_006";
 
 /// `IVRSystem_026`'s function table.
 mod system {
@@ -77,6 +70,8 @@ mod system {
     pub(super) const EYE_TO_HEAD: usize = 5;
     pub(super) const POSES: usize = 12;
     pub(super) const INDEX_FOR_ROLE: usize = 18;
+    pub(super) const DEVICE_CLASS: usize = 20;
+    pub(super) const STRING_PROPERTY: usize = 28;
     pub(super) const CONTROLLER_STATE: usize = 37;
     pub(super) const HAPTIC_PULSE: usize = 39;
     pub(super) const ENTRIES: usize = 51;
@@ -89,27 +84,21 @@ mod compositor {
     pub(super) const ENTRIES: usize = 53;
 }
 
+/// `IVRRenderModels_006`'s function table.
+mod models {
+    pub(super) const LOAD_MODEL: usize = 0;
+    pub(super) const FREE_MODEL: usize = 1;
+    pub(super) const LOAD_TEXTURE: usize = 2;
+    pub(super) const FREE_TEXTURE: usize = 3;
+    pub(super) const ENTRIES: usize = 19;
+}
+
 const APPLICATION_SCENE: i32 = 1;
 const UNIVERSE_STANDING: i32 = 1;
 const TEXTURE_DIRECTX12: i32 = 4;
-/// `VROverlayFlags_NoBackside`: the hands' pieces have back sides of their
-/// own; nothing is drawn behind a piece by the compositor.
-const NO_BACKSIDE: i32 = 1 << 29;
-
 type InitInternal = unsafe extern "C" fn(*mut i32, i32, *const c_char) -> u32;
 type GetGenericInterface = unsafe extern "C" fn(*const c_char, *mut i32) -> isize;
 type ErrorText = unsafe extern "C" fn(i32) -> *const c_char;
-
-type FindOverlay = unsafe extern "system" fn(*const c_char, *mut u64) -> i32;
-type CreateOverlay = unsafe extern "system" fn(*const c_char, *const c_char, *mut u64) -> i32;
-type SetFlag = unsafe extern "system" fn(u64, i32, bool) -> i32;
-type SetOrder = unsafe extern "system" fn(u64, u32) -> i32;
-type SetFloat = unsafe extern "system" fn(u64, f32) -> i32;
-type SetColor = unsafe extern "system" fn(u64, f32, f32, f32) -> i32;
-type SetTransformAbsolute = unsafe extern "system" fn(u64, i32, *const M34) -> i32;
-type SetTransformRelative = unsafe extern "system" fn(u64, u32, *const M34) -> i32;
-type Handle = unsafe extern "system" fn(u64) -> i32;
-type SetRaw = unsafe extern "system" fn(u64, *const c_void, u32, u32, u32) -> i32;
 
 /// `Texture_t`.
 #[repr(C)]
@@ -192,11 +181,182 @@ fn world_scale() -> f32 {
     }
 }
 
-/// The relief larger (`by` over 1) or smaller.
+/// How much of the view the title's frame takes: its height as an angle
+/// (bits of an `f32` of radians; 0 not yet read). This is not the title's
+/// own field of view, which is not known here and changes from shot to shot:
+/// it is how large the frame is shown.
+static PICTURE: AtomicU32 = AtomicU32::new(0);
+
+fn picture(mode: Mode) -> f32 {
+    match PICTURE.load(Relaxed) {
+        0 => match std::env::var("VICTORY_VR_FOV").ok().and_then(|v| v.trim().parse::<f32>().ok()) {
+            Some(asked) => asked.clamp(20.0, 140.0).to_radians(),
+            // As the headset sees: a little over its own view where the
+            // head looks about in the frame (no edge of it in sight), the
+            // view itself where the frame is fixed to the head (its corners
+            // stay in sight).
+            None => match f32::from_bits(VIEW_UP.load(Relaxed)) {
+                up if up > 0.0 => (2.0 * (up * if mode == Mode::Immersive { 1.0 } else { 1.05 }).atan()).clamp(60f32.to_radians(), 125f32.to_radians()),
+                _ => 90f32.to_radians(),
+            },
+        },
+        bits => f32::from_bits(bits),
+    }
+}
+
+/// The headset's own view: the tangent of half its height (bits of an
+/// `f32`; 0 not known).
+static VIEW_UP: AtomicU32 = AtomicU32::new(0);
+
+fn view_is(up: f32) {
+    VIEW_UP.store(up.max(0.0).to_bits(), Relaxed);
+}
+
+/// The frame shown larger (`by` over 1) or smaller.
+fn size_picture(by: f32) -> f32 {
+    let angle = (picture(mode()) * by).clamp(20f32.to_radians(), 140f32.to_radians());
+    PICTURE.store(angle.to_bits(), Relaxed);
+    angle
+}
+
+/// The whole further off and larger (`by` over 1) or nearer and smaller.
+/// The relief deeper (`by` over 1) or shallower.
 fn scale_world(by: f32) -> f32 {
     let scale = (world_scale() * by).clamp(0.05, 20.0);
     WORLD_SCALE.store(scale.to_bits(), Relaxed);
     scale
+}
+
+/// What is drawn where a controller is.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) enum Held {
+    /// The controller itself, as SteamVR draws it.
+    Controller,
+    /// The player's hand.
+    Hand,
+}
+
+/// 0 by the way of looking (the controller while watching, the hand where
+/// the head turns the camera), 1 hands, 2 controllers (F10 goes round).
+static HELD: AtomicU8 = AtomicU8::new(u8::MAX);
+
+pub(crate) fn held() -> Held {
+    let mut h = HELD.load(Relaxed);
+    if h == u8::MAX {
+        h = match std::env::var("VICTORY_VR_HANDS").as_deref() {
+            Ok("1") => 1,
+            Ok("0") => 2,
+            _ => 0,
+        };
+        HELD.store(h, Relaxed);
+    }
+    match (h, mode()) {
+        (1, _) | (0, Mode::Immersive) => Held::Hand,
+        _ => Held::Controller,
+    }
+}
+
+/// The other thing at the controllers (F10).
+fn next_held() -> Held {
+    HELD.store(if held() == Held::Hand { 2 } else { 1 }, Relaxed);
+    held()
+}
+
+/// A hand as the scene draws it.
+#[derive(Clone, Debug, PartialEq)]
+struct HandView {
+    present: bool,
+    /// SteamVR's number for the controller (the scene takes its place from
+    /// the poses it draws with); `None` for an emulated one, at `pose`.
+    device: Option<u32>,
+    pose: M34,
+    /// Thumb, index, the others: 0 flat, 1 a fist.
+    curl: [f32; 3],
+    grip: f32,
+    /// The controller's model, by SteamVR's name for it.
+    model: String,
+}
+
+impl Default for HandView {
+    fn default() -> Self {
+        Self { present: false, device: None, pose: math::IDENTITY, curl: [0.0; 3], grip: 0.0, model: String::new() }
+    }
+}
+
+/// Where a tracker is worn.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum BodyPart {
+    Waist,
+    Chest,
+    LeftFoot,
+    RightFoot,
+    LeftKnee,
+    RightKnee,
+    LeftElbow,
+    RightElbow,
+    LeftShoulder,
+    RightShoulder,
+    /// Worn somewhere SteamVR was not told.
+    Other,
+}
+
+impl BodyPart {
+    /// From the tracker's controller type (`vive_tracker_waist` and so on).
+    fn of(kind: &str) -> Self {
+        let has = |word: &str| kind.contains(word);
+        match () {
+            () if has("waist") => Self::Waist,
+            () if has("chest") => Self::Chest,
+            () if has("left_foot") => Self::LeftFoot,
+            () if has("right_foot") => Self::RightFoot,
+            () if has("left_knee") => Self::LeftKnee,
+            () if has("right_knee") => Self::RightKnee,
+            () if has("left_elbow") => Self::LeftElbow,
+            () if has("right_elbow") => Self::RightElbow,
+            () if has("left_shoulder") => Self::LeftShoulder,
+            () if has("right_shoulder") => Self::RightShoulder,
+            () => Self::Other,
+        }
+    }
+}
+
+/// A tracker on the body as the scene draws it.
+#[derive(Clone, Copy, Debug, PartialEq)]
+struct TrackerView {
+    part: BodyPart,
+    device: Option<u32>,
+    pose: M34,
+}
+
+/// What the thread that follows the devices leaves for the one that draws.
+#[derive(Clone, Debug, Default)]
+struct Views {
+    hands: [HandView; 2],
+    trackers: Vec<TrackerView>,
+}
+
+static VIEWS: Mutex<Option<Views>> = Mutex::new(None);
+
+/// The player's body as the headset's devices have it: the head, the two
+/// hands, and every tracker worn (waist, feet, knees, elbows), each where it
+/// is in the room, in SteamVR's standing space (metres; +y up, -z forward).
+/// For what turns it into the character's pose one day.
+#[derive(Clone, Debug, Default)]
+pub struct Body {
+    pub head: Option<[[f32; 4]; 3]>,
+    pub left_hand: Option<[[f32; 4]; 3]>,
+    pub right_hand: Option<[[f32; 4]; 3]>,
+    pub trackers: Vec<(BodyPart, [[f32; 4]; 3])>,
+}
+
+static BODY: Mutex<Option<Body>> = Mutex::new(None);
+
+/// The player's body now; `None` without the headset mode.
+pub fn body() -> Option<Body> {
+    if !on() {
+        return None;
+    }
+    BODY.lock().unwrap_or_else(|e| e.into_inner()).clone()
 }
 
 /// The title's pad as the headset's controllers hold it: buttons as the
@@ -300,23 +460,12 @@ fn first_runtime(text: &str) -> Option<String> {
 
 /// SteamVR's function tables.
 struct Api {
-    overlay: usize,
     system: usize,
     compositor: usize,
+    models: usize,
 }
 
 impl Api {
-    /// Entry `i` of the overlay table as a function of type `F`.
-    ///
-    /// # Safety
-    /// `F` must be the type of entry `i` of `IVROverlay_028`'s table.
-    unsafe fn overlay<F: Copy>(&self, i: usize) -> F {
-        debug_assert!(i < overlay::ENTRIES && size_of::<F>() == size_of::<usize>());
-        // SAFETY: the table holds that many function pointers; the caller
-        // names the entry's type.
-        unsafe { std::mem::transmute_copy(&*(self.overlay as *const usize).add(i)) }
-    }
-
     /// Entry `i` of the system table as a function of type `F`.
     ///
     /// # Safety
@@ -337,21 +486,14 @@ impl Api {
         unsafe { std::mem::transmute_copy(&*(self.compositor as *const usize).add(i)) }
     }
 
-    /// The overlay with `key`, made if it is not there; SteamVR's error
-    /// number otherwise.
-    fn overlay_named(&self, key: &CStr, name: &CStr) -> Result<u64, i32> {
-        let mut handle = 0u64;
-        // SAFETY: the table's entries by their types; NUL-terminated names;
-        // the handle lives through the calls.
-        unsafe {
-            if self.overlay::<FindOverlay>(overlay::FIND)(key.as_ptr(), &mut handle) == 0 {
-                return Ok(handle);
-            }
-            match self.overlay::<CreateOverlay>(overlay::CREATE)(key.as_ptr(), name.as_ptr(), &mut handle) {
-                0 => Ok(handle),
-                error => Err(error),
-            }
-        }
+    /// Entry `i` of the render models' table as a function of type `F`.
+    ///
+    /// # Safety
+    /// `F` must be the type of entry `i` of `IVRRenderModels_006`'s table.
+    unsafe fn models<F: Copy>(&self, i: usize) -> F {
+        debug_assert!(i < models::ENTRIES && size_of::<F>() == size_of::<usize>());
+        // SAFETY: as above.
+        unsafe { std::mem::transmute_copy(&*(self.models as *const usize).add(i)) }
     }
 }
 
@@ -431,7 +573,7 @@ fn open() -> Result<Api, String> {
         let table = unsafe { interface(name.as_ptr(), &mut error) };
         if table == 0 || error != 0 { Err(format!("the runtime has no {}: {}", name.to_string_lossy(), said(error))) } else { Ok(table as usize) }
     };
-    let api = Api { overlay: table(OVERLAY_INTERFACE)?, system: table(SYSTEM_INTERFACE)?, compositor: table(COMPOSITOR_INTERFACE)? };
+    let api = Api { system: table(SYSTEM_INTERFACE)?, compositor: table(COMPOSITOR_INTERFACE)?, models: table(MODELS_INTERFACE)? };
     tracing::info!(runtime = %folder.display(), mode = ?mode(), "the headset mode: SteamVR is reached (VICTORY_VR=1)");
     Ok(api)
 }
@@ -526,18 +668,32 @@ pub(crate) fn depth_bound(resource: usize) {
     }
 }
 
-/// The depth buffer the frame drew the most with, of the picture's shape
-/// (not a shadow map's square), and the table emptied for the next frame.
+/// The depth buffer the title draws its frames with: the one bound the
+/// most over the last few presents, of the picture's shape (not a shadow
+/// map's square).
+///
+/// Counted over several presents and not for each: the title's threads
+/// record a frame while the one before it is being submitted, so the binds
+/// between two presents are not one frame's (counted for each present, some
+/// frames had none and were shown flat). What each buffer was bound for is
+/// halved at every present; one no frame draws with any more is forgotten
+/// within some ten of them. The buffer holds the presented frame's depth
+/// when our copy runs: the card runs submissions in their order, and the
+/// next frame's come behind the present.
 fn main_depth() -> Option<(std::sync::Arc<crate::resource::HostTexture>, DepthKind, (u32, u32))> {
     let mut best: Option<(u32, std::sync::Arc<crate::resource::HostTexture>, DepthKind, (u32, u32))> = None;
     for i in 0..DEPTHS {
-        let count = DEPTH_COUNT[i].swap(0, Relaxed);
         let resource = DEPTH_SEEN[i].load(Relaxed);
-        if count == 0 {
-            // Not bound this frame: its place goes to others.
-            DEPTH_SEEN[i].store(0, Relaxed);
+        if resource == 0 {
             continue;
         }
+        let count = DEPTH_COUNT[i].load(Relaxed);
+        if count == 0 {
+            // Its place goes to others.
+            let _ = DEPTH_SEEN[i].compare_exchange(resource, 0, Relaxed, Relaxed);
+            continue;
+        }
+        DEPTH_COUNT[i].fetch_sub(count - count / 2, Relaxed);
         if best.as_ref().is_some_and(|b| b.0 >= count) {
             continue;
         }

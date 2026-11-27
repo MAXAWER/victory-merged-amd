@@ -5,8 +5,8 @@
 # -RayTracing   builds the ray-tracing structures for the title's indirect light (VICTORY_BVH_BUILDER=1); works on an RX 9070 XT, about 14-15 fps in heavy scenes
 # -Fps30        leaves the frame interval setting out
 # -More         other settings: -More @{VICTORY_AMBIENT='1.0'}
-# -VR           the headset mode over SteamVR (README.md, "VR"): the picture for each eye, hands, the controllers as the pad
-# -VRMode       3d (the frame as a relief around you, from its depth buffer), cinema (a flat screen in the room), immersive (a wide screen fixed to the head)
+# -VR           the headset mode over SteamVR (README.md, "The VR mod"): the picture for each eye, hands or controllers, the controllers as the pad, body trackers
+# -VRMode       3d (the frame as a relief around you, from its depth buffer), cinema (a flat screen in the room), immersive (the relief fixed to the head, the head turns the camera)
 # -VREmu        the headset mode with no headset: SteamVR's stand-in headset in a window and hands that move by themselves
 param(
     [string]$Game = "",

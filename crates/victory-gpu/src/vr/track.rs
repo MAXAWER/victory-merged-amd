@@ -1,8 +1,10 @@
-//! The thread of the headset mode ("victory-vr"): some ninety times a second
-//! it asks where the head and the controllers are and what their buttons
-//! say, moves the hands' pieces and the screen, and leaves the title's pad
-//! as the controllers hold it for `victory_hle`'s input to take
-//! ([`super::pad`]).
+//! The thread of the headset mode that follows the devices ("victory-vr"):
+//! some ninety times a second it asks where the head, the controllers and
+//! the trackers worn on the body are and what the controllers' buttons say,
+//! and leaves three things for others: the title's pad as the controllers
+//! hold it ([`super::pad`], taken by `victory_hle`'s input), the hands and
+//! trackers for the thread that draws ([`super::Views`]), and the player's
+//! body ([`super::body`]).
 //!
 //! The controllers as the pad (SteamVR's legacy controller state: an
 //! analogue stick or pad, a trigger, a grip, two face buttons):
@@ -19,17 +21,18 @@
 //! `y`, `lb`, `rb`, `lt`, `rt`; `b` unless said otherwise) and the
 //! controller ticks.
 //!
-//! In `immersive` the head's turning is added to the right stick: a full
-//! push for `VICTORY_VR_LOOK` degrees a second (160).
+//! Where the picture is fixed to the head (`immersive`) the head's turning
+//! is added to the right stick: a full push for `VICTORY_VR_LOOK` degrees a
+//! second (160).
+//!
+//! The keys: F6 the next way of looking, F7 the view centred again, F8 and
+//! F9 the frame shown smaller and larger (with Ctrl: the whole nearer and
+//! further off), F10 hands or controllers.
 
 use std::time::{Duration, Instant};
 
-use super::hands::{self, INDEX, OTHERS, PIECES, THUMB};
-use super::math::{IDENTITY, M34, V3, dot, from_axes, level_forward, mul, pitch, place, scale, sub};
-use super::{
-    Api, HandIn, Handle, Mode, NO_BACKSIDE, Pad, SetColor, SetFlag, SetFloat, SetOrder, SetRaw, SetTransformAbsolute, SetTransformRelative,
-    UNIVERSE_STANDING, emu, number, overlay, system,
-};
+use super::math::{IDENTITY, M34, V3, dot, level_forward, pitch, place, scale, sub};
+use super::{Api, BodyPart, HandIn, HandView, Mode, Pad, TrackerView, UNIVERSE_STANDING, Views, emu, hands, number, system};
 
 /// `TrackedDevicePose_t`.
 #[repr(C)]
@@ -59,11 +62,19 @@ type Poses = unsafe extern "system" fn(i32, f32, *mut Pose, u32);
 type IndexForRole = unsafe extern "system" fn(i32) -> u32;
 type GetState = unsafe extern "system" fn(u32, *mut ControllerState, u32) -> bool;
 type Haptic = unsafe extern "system" fn(u32, u32, u16);
+type DeviceClass = unsafe extern "system" fn(u32) -> i32;
+type StringProperty = unsafe extern "system" fn(u32, i32, *mut std::ffi::c_char, u32, *mut i32) -> u32;
 
 const DEVICES: usize = 64;
 const HEAD: usize = 0;
 /// `ETrackedControllerRole`: left, right.
 const ROLES: [i32; 2] = [1, 2];
+/// `ETrackedDeviceClass`: a tracker worn or fixed to something.
+const CLASS_TRACKER: i32 = 3;
+/// `ETrackedDeviceProperty`: the model SteamVR draws a device with, and the
+/// kind of a controller or tracker.
+const PROPERTY_MODEL: i32 = 1003;
+const PROPERTY_KIND: i32 = 7000;
 /// `EVRButtonId` bits of the legacy state.
 const BUTTON_UPPER: u64 = 1 << 1;
 const BUTTON_GRIP: u64 = 1 << 2;
@@ -104,97 +115,29 @@ fn key(virtual_key: i32) -> bool {
     unsafe { windows_sys::Win32::UI::Input::KeyboardAndMouse::GetAsyncKeyState(virtual_key) as u16 & 0x8000 != 0 }
 }
 
-/// One hand as it is shown.
-struct Shown {
+/// A string property of a device; empty if it has none.
+fn property(api: &Api, device: u32, property: i32) -> String {
+    let mut text = [0u8; 256];
+    let mut error = 0i32;
+    // SAFETY: the table's entry by its type; the buffer is of the size said.
+    let length = unsafe { api.system::<StringProperty>(system::STRING_PROPERTY)(device, property, text.as_mut_ptr().cast(), text.len() as u32, &mut error) };
+    if error != 0 || length == 0 {
+        return String::new();
+    }
+    let end = text.iter().position(|&b| b == 0).unwrap_or(text.len());
+    String::from_utf8_lossy(&text[..end]).into_owned()
+}
+
+/// One hand's state from tick to tick.
+struct Hand {
     right: bool,
-    /// The pieces' overlays, front sides then back sides if there are any.
-    handles: Vec<u64>,
-    visible: bool,
     curl: [f32; 3],
-    /// What the pieces were last placed for, with a real controller.
-    placed: Option<(u32, [f32; 3])>,
     /// For the speed of an emulated hand, and for strikes.
     before: Option<(V3, Instant)>,
     strike_until: Option<Instant>,
     strike_again: Instant,
-}
-
-impl Shown {
-    fn new(right: bool, now: Instant) -> Self {
-        Self { right, handles: Vec::new(), visible: false, curl: [0.0; 3], placed: None, before: None, strike_until: None, strike_again: now }
-    }
-
-    /// Makes the pieces' overlays the first time the hand is there.
-    fn make(&mut self, api: &Api, sides: usize) {
-        if !self.handles.is_empty() {
-            return;
-        }
-        let pieces = hands::pieces(self.right, [0.0; 3]);
-        for side in 0..sides {
-            for (i, piece) in pieces.iter().enumerate() {
-                let key = std::ffi::CString::new(format!("victory.hand.{}.{side}.{i}", if self.right { "right" } else { "left" })).unwrap_or_default();
-                let Ok(handle) = api.overlay_named(&key, c"VIctory hand") else {
-                    continue;
-                };
-                let (texels, width, height) = hands::picture(piece.size);
-                // The palm a shade darker than the fingers.
-                let tone = if i == 0 { [0.80, 0.60, 0.48] } else { [0.90, 0.70, 0.56] };
-                // SAFETY: the table's entries by their types; the texels
-                // live through the call, which copies them.
-                unsafe {
-                    api.overlay::<SetRaw>(overlay::SET_RAW)(handle, texels.as_ptr().cast(), width, height, 4);
-                    api.overlay::<SetFloat>(overlay::SET_WIDTH)(handle, piece.size[0]);
-                    api.overlay::<SetColor>(overlay::SET_COLOR)(handle, tone[0], tone[1], tone[2]);
-                    api.overlay::<SetFlag>(overlay::SET_FLAG)(handle, NO_BACKSIDE, true);
-                    // Over the screen; the palm under the fingers.
-                    api.overlay::<SetOrder>(overlay::SET_SORT_ORDER)(handle, if i == 0 { 1 } else { 2 });
-                }
-                self.handles.push(handle);
-            }
-        }
-        tracing::info!(right = self.right, pieces = self.handles.len(), "the headset mode: a hand's pieces are made");
-    }
-
-    fn show(&mut self, api: &Api, visible: bool) {
-        if self.visible == visible {
-            return;
-        }
-        self.visible = visible;
-        self.placed = None;
-        let entry = if visible { overlay::SHOW } else { overlay::HIDE };
-        for &handle in &self.handles {
-            // SAFETY: the table's entry by its type.
-            unsafe { api.overlay::<Handle>(entry)(handle) };
-        }
-    }
-
-    /// Places the pieces for the controller `hand`.
-    fn place(&mut self, api: &Api, hand: &HandIn) {
-        // With a real controller SteamVR moves the pieces itself: they are
-        // told their place on it only when the fingers have moved.
-        let curl = self.curl.map(|c| (c * 50.0).round() / 50.0);
-        if let Some(device) = hand.device {
-            if self.placed == Some((device, curl)) {
-                return;
-            }
-            self.placed = Some((device, curl));
-        }
-        let pieces = hands::pieces(self.right, curl);
-        // The back side of a piece: the same place, turned about its length.
-        let back = from_axes([-1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, -1.0], [0.0; 3]);
-        for (n, &handle) in self.handles.iter().enumerate() {
-            let piece = &pieces[n % PIECES];
-            let at = if n < PIECES { piece.at } else { mul(&piece.at, &back) };
-            // SAFETY: the table's entries by their types; the matrix lives
-            // through the call.
-            unsafe {
-                match hand.device {
-                    Some(device) => api.overlay::<SetTransformRelative>(overlay::SET_TRANSFORM_RELATIVE)(handle, device, &at),
-                    None => api.overlay::<SetTransformAbsolute>(overlay::SET_TRANSFORM_ABSOLUTE)(handle, UNIVERSE_STANDING, &mul(&hand.pose, &at)),
-                };
-            }
-        }
-    }
+    /// The controller's model, asked once for each device number.
+    model: Option<(u32, String)>,
 }
 
 /// The real controllers, as SteamVR has them now.
@@ -227,6 +170,33 @@ fn controllers(api: &Api, poses: &[Pose; DEVICES]) -> [HandIn; 2] {
             }
         }
     })
+}
+
+/// The trackers worn, as SteamVR has them now.
+fn trackers(api: &Api, poses: &[Pose; DEVICES], kinds: &mut [Option<BodyPart>; DEVICES]) -> Vec<TrackerView> {
+    let mut out = Vec::new();
+    for device in 1..DEVICES {
+        if !(poses[device].valid && poses[device].connected) {
+            kinds[device] = None;
+            continue;
+        }
+        let part = match kinds[device] {
+            Some(part) => part,
+            None => {
+                // SAFETY: the table's entry by its type.
+                if unsafe { api.system::<DeviceClass>(system::DEVICE_CLASS)(device as u32) } != CLASS_TRACKER {
+                    continue;
+                }
+                let kind = property(api, device as u32, PROPERTY_KIND);
+                let part = BodyPart::of(&kind);
+                tracing::info!(device, kind, ?part, "the headset mode: a tracker on the body");
+                kinds[device] = Some(part);
+                part
+            }
+        };
+        out.push(TrackerView { part, device: Some(device as u32), pose: poses[device].at });
+    }
+    out
 }
 
 fn dead(v: f32) -> f32 {
@@ -263,15 +233,19 @@ fn pad_of(hands: &[HandIn; 2]) -> Pad {
 /// The thread's body: never returns.
 pub(super) fn run(api: &'static Api) {
     let emulated = std::env::var_os("VICTORY_VR_EMU").is_some_and(|v| v != "0");
-    let sides = if std::env::var_os("VICTORY_VR_HAND_SIDES").is_some_and(|v| v == "1") { 1 } else { 2 };
+    let reaching = std::env::var("VICTORY_VR_EMU_POSE").is_ok_and(|v| v == "reach");
+    let no_trackers = std::env::var_os("VICTORY_VR_EMU_TRACKERS").is_some_and(|v| v == "0");
+    let emulated_model = std::env::var("VICTORY_VR_EMU_MODEL").unwrap_or_else(|_| "vr_controller_vive_1_5".into());
     let strike_speed = number("VICTORY_VR_STRIKE_SPEED", 1.4).max(0.2);
     let look = number("VICTORY_VR_LOOK", 160.0).max(10.0);
     let strike = strike_button();
     let began = Instant::now();
-    let mut shown = [Shown::new(false, began), Shown::new(true, began)];
+    let new = |right| Hand { right, curl: [0.0; 3], before: None, strike_until: None, strike_again: began, model: None };
+    let mut state = [new(false), new(true)];
+    let mut kinds: [Option<BodyPart>; DEVICES] = [None; DEVICES];
     let mut head = IDENTITY;
     let mut head_seen = false;
-    let mut keys = [false; 4];
+    let mut keys = [false; 5];
     let mut turned: Option<(f32, f32)> = None;
     let mut rates = [0.0f32; 2];
     let mut strikes = 0u64;
@@ -295,12 +269,21 @@ pub(super) fn run(api: &'static Api) {
                 super::RECENTRE.store(true, std::sync::atomic::Ordering::Relaxed);
             }
         }
-        let hands_in = if emulated { emu::hands((now - began).as_secs_f32(), &head) } else { controllers(api, &poses) };
+        let seconds = (now - began).as_secs_f32();
+        let hands_in = match (emulated, reaching) {
+            (true, true) => emu::reaching(seconds, &head),
+            (true, false) => emu::hands(seconds, &head),
+            (false, _) => controllers(api, &poses),
+        };
+        let worn = match emulated {
+            true if no_trackers => Vec::new(),
+            true => emu::trackers(&head),
+            false => trackers(api, &poses, &mut kinds),
+        };
         let (forward, yaw) = level_forward(&head);
 
-        // The keys: F6 the next way of looking, F7 the view centred again,
-        // F8 and F9 the relief smaller and larger.
-        let down = [key(0x75), key(0x76), key(0x77), key(0x78)];
+        // The keys.
+        let down = [key(0x75), key(0x76), key(0x77), key(0x78), key(0x79)];
         let pressed = |k: usize| down[k] && !keys[k];
         if pressed(0) {
             let mode = super::next_mode();
@@ -310,50 +293,62 @@ pub(super) fn run(api: &'static Api) {
             super::RECENTRE.store(true, std::sync::atomic::Ordering::Relaxed);
         }
         if pressed(2) || pressed(3) {
-            let scale = super::scale_world(if pressed(2) { 0.8 } else { 1.25 });
-            tracing::info!(scale, "the headset mode: the relief's scale (F8, F9)");
+            // With Ctrl: how near the whole is; without: how large the frame is shown.
+            if key(0x11) {
+                let scale = super::scale_world(if pressed(2) { 0.8 } else { 1.25 });
+                tracing::info!(scale, "the headset mode: the world's scale (Ctrl+F8 nearer, Ctrl+F9 further)");
+            } else {
+                let degrees = super::size_picture(if pressed(2) { 0.9 } else { 1.0 / 0.9 }).to_degrees();
+                tracing::info!(degrees, "the headset mode: the frame's size (F8, F9)");
+            }
+        }
+        if pressed(4) {
+            let held = super::next_held();
+            tracing::info!(?held, "the headset mode: what is drawn at the controllers (F10)");
         }
         keys = down;
         let mode = super::mode();
 
         // The hands, and what they strike.
         let mut pad = pad_of(&hands_in);
-        for (hand, shown) in hands_in.iter().zip(&mut shown) {
+        let mut views = Views { hands: Default::default(), trackers: worn };
+        for ((hand, state), view) in hands_in.iter().zip(&mut state).zip(&mut views.hands) {
             if !hand.present {
-                shown.show(api, false);
-                shown.before = None;
+                state.before = None;
                 continue;
             }
-            shown.make(api, sides);
-            let wanted = {
-                let mut c = [0.0; 3];
-                c[THUMB] = hand.grip;
-                c[INDEX] = hand.grip.max(hand.trigger);
-                c[OTHERS] = hand.grip;
-                c
-            };
-            for (have, want) in shown.curl.iter_mut().zip(wanted) {
+            for (have, want) in state.curl.iter_mut().zip(hands::wanted(hand.grip, hand.trigger)) {
                 *have += (want - *have) * (dt * 22.0).min(1.0);
             }
-            shown.place(api, hand);
-            shown.show(api, true);
+            let model = match hand.device {
+                None => emulated_model.clone(),
+                Some(device) => {
+                    if state.model.as_ref().is_none_or(|(d, _)| *d != device) {
+                        let name = property(api, device, PROPERTY_MODEL);
+                        tracing::info!(right = state.right, device, model = name, kind = property(api, device, PROPERTY_KIND), "the headset mode: a controller");
+                        state.model = Some((device, name));
+                    }
+                    state.model.as_ref().map(|(_, name)| name.clone()).unwrap_or_default()
+                }
+            };
+            *view = HandView { present: true, device: hand.device, pose: hand.pose, curl: state.curl, grip: hand.grip, model };
             let at = place(&hand.pose);
-            let velocity = hand.velocity.or_else(|| shown.before.map(|(was, when)| scale(sub(at, was), 1.0 / (now - when).as_secs_f32().max(1e-3))));
-            shown.before = Some((at, now));
+            let velocity = hand.velocity.or_else(|| state.before.map(|(was, when)| scale(sub(at, was), 1.0 / (now - when).as_secs_f32().max(1e-3))));
+            state.before = Some((at, now));
             let thrown = velocity.map_or(0.0, |v| dot(v, forward));
-            if hand.grip > 0.7 && thrown > strike_speed && now >= shown.strike_again {
-                shown.strike_until = Some(now + STRIKE_HELD);
-                shown.strike_again = now + STRIKE_AGAIN;
+            if hand.grip > 0.7 && thrown > strike_speed && now >= state.strike_again {
+                state.strike_until = Some(now + STRIKE_HELD);
+                state.strike_again = now + STRIKE_AGAIN;
                 strikes += 1;
                 if strikes <= 12 || strikes.is_power_of_two() {
-                    tracing::info!(right = shown.right, speed = thrown, strikes, ?strike, "the headset mode: a strike");
+                    tracing::info!(right = state.right, speed = thrown, strikes, ?strike, "the headset mode: a strike");
                 }
                 if let Some(device) = hand.device {
                     // SAFETY: the table's entry by its type.
                     unsafe { api.system::<Haptic>(system::HAPTIC_PULSE)(device, 0, 3000) };
                 }
             }
-            if shown.strike_until.is_some_and(|until| now < until) {
+            if state.strike_until.is_some_and(|until| now < until) {
                 match strike {
                     Strike::Button(bit) => pad.buttons |= bit,
                     Strike::LeftTrigger => pad.left_trigger = 1.0,
@@ -386,17 +381,27 @@ pub(super) fn run(api: &'static Api) {
         turned = Some(facing);
 
         *super::PAD.lock().unwrap_or_else(|e| e.into_inner()) = Some(pad);
+        let hand_at = |i: usize| views.hands[i].present.then_some(views.hands[i].pose);
+        *super::BODY.lock().unwrap_or_else(|e| e.into_inner()) = Some(super::Body {
+            head: head_seen.then_some(head),
+            left_hand: hand_at(0),
+            right_hand: hand_at(1),
+            trackers: views.trackers.iter().map(|t| (t.part, t.pose)).collect(),
+        });
+        let seen = (views.hands[0].present, views.hands[1].present, views.trackers.len());
+        *super::VIEWS.lock().unwrap_or_else(|e| e.into_inner()) = Some(views);
 
         if now - said >= Duration::from_secs(5) {
             said = now;
             tracing::info!(
                 ?mode,
+                held = ?super::held(),
                 head_seen,
                 head = ?place(&head).map(|v| (v * 100.0).round() / 100.0),
-                left = ?hands_in[0].present.then(|| place(&hands_in[0].pose).map(|v| (v * 100.0).round() / 100.0)),
-                right = ?hands_in[1].present.then(|| place(&hands_in[1].pose).map(|v| (v * 100.0).round() / 100.0)),
-                curl_left = ?shown[0].curl.map(|v| (v * 100.0).round() / 100.0),
-                curl_right = ?shown[1].curl.map(|v| (v * 100.0).round() / 100.0),
+                hands = ?(seen.0, seen.1),
+                trackers = seen.2,
+                curl_left = ?state[0].curl.map(|v| (v * 100.0).round() / 100.0),
+                curl_right = ?state[1].curl.map(|v| (v * 100.0).round() / 100.0),
                 ?pad,
                 strikes,
                 "the headset mode: where things are"
