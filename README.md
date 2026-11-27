@@ -73,6 +73,22 @@ These are the settings with a clean picture. The fast settings of the base (pres
 
 Every run is recorded at 60 frames a second and looked through by a script for frames held, pictures going back and tiles flashing.
 
+## VR (SteamVR)
+
+`Play-VR.cmd` starts the title in the headset mode (`scripts\play.ps1 -VR`). SteamVR must be installed; it is started if it is not running.
+
+| | |
+| --- | --- |
+| `3d` (default) | The game's frame as a relief around you, rebuilt from its depth buffer: in cutscenes you stand where the camera stands, with real depth in both eyes and parallax when you move your head. Drawn by the mod at the headset's rate, so it stays smooth while the game runs at 20-25 fps. |
+| `cinema` | A flat screen standing in the room (`-VRMode cinema`). |
+| `immersive` | A wide flat screen fixed to your head; turning your head turns the game's camera (`-VRMode immersive`). |
+| Hands | A palm and five fingers follow each controller. The grip closes the hand into a fist, the trigger bends the index finger. A fist thrown forward presses the game's melee button (B; `-More @{VICTORY_VR_STRIKE='a'}` for another), with a tick in the controller. |
+| Controllers | Left stick and trigger, right stick and trigger, the face buttons as A/B/X/Y, both sticks pressed for the menu. The keyboard and mouse keep working. |
+| Keys | F6 next view, F7 centre the view where you look, F8 / F9 make the relief smaller / larger. |
+| No headset | `Play-VR.cmd -VREmu`: SteamVR's built-in stand-in headset in a window, hands that clench, strike and open by themselves, a head that sways a little. Your own SteamVR settings are not touched (the stand-in keeps its own in `%LOCALAPPDATA%\victory\vr-emu`). |
+
+What it is not yet: the game's own first-person camera, and hands that are the character's. The relief is one frame seen from one place, so what the camera did not see (behind people, around corners) is dark when you lean far to the side. The game's field of view is not read from the game: `-More @{VICTORY_VR_FOV='60'}` changes the assumed one (50 degrees).
+
 ## Known problems
 
 - Not yet 30 fps: 22-26 fps in the playable scenes with the clean settings. At a shore with 6,500 draws the thread that submits prepares the frame's 37 submissions for about 24 ms and the card works 32 ms (its own timestamps); the two overlap badly: the card idles about 12 ms a frame while submissions are prepared, and the present waits about 8 ms for it at the end.

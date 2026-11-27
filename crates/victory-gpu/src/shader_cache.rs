@@ -498,6 +498,7 @@ mod tests {
                 byte_offset: 32,
                 shift: 5,
             }],
+            half_views: Vec::new(),
         }
     }
 

@@ -160,6 +160,39 @@ fn fallback(keys: &[KeyState], mouse: Mouse) -> PadState {
     }
 }
 
+/// (Local) The pad as a headset's controllers hold it (`victory_gpu::vr`, the
+/// headset mode); nothing without that mode.
+fn headset() -> Option<PadState> {
+    #[cfg(windows)]
+    {
+        use victory_gpu::vr::Pad;
+        let pad = victory_gpu::vr::pad()?;
+        const BITS: [(u32, u32); 10] = [
+            (Pad::A, A),
+            (Pad::B, B),
+            (Pad::X, X),
+            (Pad::Y, Y),
+            (Pad::MENU, MENU),
+            (Pad::VIEW, VIEW),
+            (Pad::LEFT_SHOULDER, LEFT_SHOULDER),
+            (Pad::RIGHT_SHOULDER, RIGHT_SHOULDER),
+            (Pad::LEFT_STICK, LEFT_STICK),
+            (Pad::RIGHT_STICK, RIGHT_STICK),
+        ];
+        Some(PadState {
+            buttons: BITS.iter().filter(|(theirs, _)| pad.buttons & theirs != 0).fold(0, |all, (_, ours)| all | ours),
+            left_trigger: pad.left_trigger,
+            right_trigger: pad.right_trigger,
+            left_x: pad.left_x,
+            left_y: pad.left_y,
+            right_x: pad.right_x,
+            right_y: pad.right_y,
+        })
+    }
+    #[cfg(not(windows))]
+    None
+}
+
 /// Two pads as one: buttons of both, and of each axis and trigger the one
 /// pushed further.
 fn merged(a: PadState, b: PadState) -> PadState {
@@ -508,7 +541,7 @@ impl State {
         let now = now();
         let mut events = std::mem::take(&mut self.pending);
         if one_pad {
-            let pad = pads.into_iter().flatten().fold(fallback(&keys, mouse()), merged);
+            let pad = pads.into_iter().flatten().chain(headset()).fold(fallback(&keys, mouse()), merged);
             self.update(devices, FALLBACK, Some(Value::Pad(pad)), now, &mut events);
             self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
             return events;
@@ -517,7 +550,7 @@ impl State {
         for (slot, pad) in pads.into_iter().enumerate() {
             self.update(devices, slot, pad.map(Value::Pad), now, &mut events);
         }
-        let fallback = (!any_pad).then(|| Value::Pad(fallback(&keys, mouse())));
+        let fallback = (!any_pad).then(|| Value::Pad(headset().into_iter().fold(fallback(&keys, mouse()), merged)));
         self.update(devices, FALLBACK, fallback, now, &mut events);
         self.update(devices, KEYBOARD, Some(Value::Keys(keys)), now, &mut events);
         events

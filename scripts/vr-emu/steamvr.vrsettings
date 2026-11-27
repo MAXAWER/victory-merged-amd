@@ -1,0 +1,42 @@
+{
+   "steamvr": {
+      "activateMultipleDrivers": false,
+      "enableHomeApp": false,
+      "forcedDriver": "null",
+      "installID": "1",
+      "requireHmd": true,
+      "showMirrorView": false,
+      "startMonitorOnVRStartup": true
+   },
+   "driver_null": {
+      "displayFrequency": 60,
+      "enable": true,
+      "loadPriority": 999,
+      "modelNumber": "Emulated Headset",
+      "renderHeight": 1080,
+      "renderWidth": 960,
+      "secondsFromVsyncToPhotons": 0.011,
+      "serialNumber": "Emulated Headset",
+      "windowHeight": 720,
+      "windowWidth": 1280,
+      "windowX": 40,
+      "windowY": 40
+   },
+   "power": {
+      "pauseCompositorOnStandby": false,
+      "turnOffScreensTimeout": 86400.0,
+      "turnOffControllersTimeout": 0.0,
+      "overrideWindowsPowerScheme": false,
+      "returnToWatchdogTimeout": 0.0
+   },
+   "dashboard": {
+      "enableDashboard": false
+   },
+   "collisionBounds": {
+      "CollisionBoundsColorGammaA": 0,
+      "CollisionBoundsGroundPerimeterOn": false,
+      "CollisionBoundsCenterMarkerOn": false,
+      "CollisionBoundsPlaySpaceOn": false,
+      "CollisionBoundsFadeDistance": 0.0
+   }
+}
