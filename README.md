@@ -1,4 +1,4 @@
-# victory-merged-amd
+# victory-merged-amd-VR
 
 A merged runtime of the VIctory family (GPL-3.0-or-later): it runs an Xbox Series
 title natively on Windows from files you supply, with the console's GPU programs
